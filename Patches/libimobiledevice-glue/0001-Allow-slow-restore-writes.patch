@@ -1,0 +1,13 @@
+diff --git a/src/socket.c b/src/socket.c
+index 5d22d14..65c36b7 100644
+--- a/src/socket.c
++++ b/src/socket.c
+@@ -71,7 +71,7 @@
+ #endif
+ 
+ #define RECV_TIMEOUT 20000
+-#define SEND_TIMEOUT 10000
++#define SEND_TIMEOUT 120000
+ #define CONNECT_TIMEOUT 5000
+ 
+ #ifndef EAFNOSUPPORT

@@ -173,8 +173,8 @@ Swift 6.4.2. `kern.hv_support` is 1. Swift compilation and the tests passed;
 the two tests that need real image inputs were skipped. The installed Homebrew
 QEMU 11.1.3 lists `hvf` and `tcg`, but has no `vmapple` machine. A separate
 source build, QEMU 11.1.50, ran OpenAVB to its DFU-ready message as described
-below. Ventura 13.6 RestoreOS has run, but a complete installation and normal
-macOS startup have not yet passed with this profile.
+below. Ventura 13.6 completed restoration and booted from its installed disk
+to Setup Assistant in the native Reims window.
 
 Independent shallow clones, with no submodules initialized, are kept under
 the ignored `.build/Dependencies` directory:
@@ -315,8 +315,8 @@ disk, and throws if RestoreOS does not reset within its completion timeout.
 Actual restore attempts used one vCPU and 8 GiB RAM. Native ticket requests
 returned a 5,504-byte AP ticket; iBSS, iBEC and RestoreOS ran, and the guest
 reported `VirtualMac2,1` with the expected full 64-bit ECID. The main
-filesystem transfer and verification completed. Subsequent attempts failed
-during Cryptex or BaseSystem transfers; installation has not completed.
+filesystem transfer and verification completed. Earlier attempts failed
+during Cryptex or BaseSystem transfers before the successful run below.
 The first attempt also exposed Darwin SIGPIPE and repeated socket-close
 problems, now guarded by `SO_NOSIGPIPE` and idempotent close.
 
@@ -327,10 +327,98 @@ connection, with sequence space reserved before USB I/O; previously another
 thread could emit an ACK with an old sequence number. A Unix-socket test
 checks the emitted ACKs and sequence ordering while USB completion is delayed.
 All 46 tests in 17 suites passed (tests needing optional real images were
-skipped). Another complete restore is running with these fixes; its result
-and normal startup remain unverified. Prior attempt logs are preserved under
+skipped). Prior attempt logs are preserved under
 `Build/restore-attempt-*` on the external disk. These observations do not yet
 prove the sole cause of every failed transfer.
+
+The successful restore uses libimobiledevice-glue 1.3.3 at
+`ecc0f1ba4fca96f3d7ef060b6c53f2e0bcfe829f`, with
+`Patches/libimobiledevice-glue/0001-Allow-slow-restore-writes.patch`.
+It changes the socket write deadline from 10 to 120 seconds, keeping a finite
+timeout. Autotools built it in `.build/idevice-glue-build` and installed it
+under the external `Build/restore-tools` prefix. The `idevicerestore-patient`
+shell entry point sets `DYLD_LIBRARY_PATH` to that prefix's `lib` directory
+and executes `bin/idevicerestore`; the Homebrew installation is unchanged.
+`Build/glue-runtime-libraries.log` confirms the local dylib was loaded;
+its SHA-256 is
+`9a4e7a6d6250a915dcdcb8c4866141d8ac53a84072a3073de111f1004c8b9b93`.
+
+A native C socketpair control filled a nonblocking sender, called
+`socket_send` on another thread, and drained the peer after 12 seconds.
+The Homebrew library returned `-60` after 10.001 s; the local library sent
+one byte after 12.002 s. The source and result are in
+`Build/socket-timeout-probe.c` and `Build/socket-timeout-check.txt`.
+With the local library, the same one-vCPU, 8 GiB restore completed Cryptex,
+both BaseSystem transfers, boot-policy generation and system-volume sealing.
+The guest's log reported `Status: Restore Finished` and `DONE` at 16:44 CST
+on 2026-11-10. The CLI observed its reset, exited with status 0, and saved
+`installed: "13.6 (22G120)"`. The successful logs and VM configuration are
+preserved under `Build/restore-attempt-06-success`.
+
+The same disk then booted with four vCPUs, 8 GiB RAM, OpenAVB and `--window`.
+iBoot reported `Local boot`; QMP listed four AArch64 CPUs and `running`.
+The user supplied a capture of the native Reims window showing Ventura's
+Setup Assistant welcome screen with **Get Started**, confirming actual
+graphical startup. An earlier QMP screenshot still showed the initial
+display placeholder. A subsequent HMP `info registers` query blocked:
+the native thread sample found `qemu_main` waiting in
+`qmp_human_monitor_command -> cpu_dump_state -> do_run_on_cpu`, while the
+HVF CPU threads were predominantly in Hypervisor's `wait_for_interrupt`.
+The native window still changed its capture title, but neither pointer nor
+keyboard input reached the guest, and even QMP `query-status` timed out.
+Window input is queued for QEMU's event loop, which was blocked by that
+synchronous register request. The sample and preceding logs are preserved
+under `Build/input-freeze-before-restart`.
+
+After the user approved terminating the blocked process, the same disk was
+restarted with the same four vCPUs, 8 GiB and window mode, without querying
+registers. QMP `query-status` responded, `screendump` produced the language
+selection page (`Build/ventura-input-check.png`), and the user confirmed that
+both pointer and keyboard worked again. This establishes the observed
+blocking path and a working restart workaround; the underlying failure to
+complete the HVF CPU synchronization is still unverified. Avoid HMP register
+queries on this running profile until that path is investigated in an
+isolated test VM.
+No user account was created, and desktop stability, networking and subsequent
+guest versions were not tested. No system AVPBooter was read and no
+Virtualization.framework restore API was used.
+
+The installed VM is at `/Volumes/Zonglin's Disk/VMApple/vms/ventura-13.6-hvf`.
+For a later launch after shutting it down:
+
+```sh
+/Users/guozonglin/Desktop/Github/vmapple-cli/.build/debug/vmapple-cli boot \
+  "/Volumes/Zonglin's Disk/VMApple/vms/ventura-13.6-hvf" \
+  --qemu "/Volumes/Zonglin's Disk/VMApple/Build/qemu/qemu-system-aarch64" \
+  --rom "/Volumes/Zonglin's Disk/VMApple/Build/openavb/OpenAVB.bin" \
+  --cpus 4 --memory 8 --window
+```
+
+### Unresolved Metal timeout and diagnostic checkpoint
+
+The successful startup and short input check do not establish stability.
+On a later run (QEMU PID 6673), the host's Metal log reported GPU timeouts
+at 16:57:22 and 16:57:27 CST on 2026-11-10, followed by submissions ignored
+because of prior GPU errors. There were 1,019 command-buffer failure lines.
+At 16:58:44 QEMU logged `Guest crash loaded`; the host logged process exit
+at 16:58:45. A host watchdog kill and the guest's precise panic cause have
+not been established. This was separate from the HMP register-query blockage.
+
+An APFS clone at `vms/ventura-metal-debug-20261110-01` runs the same four-vCPU,
+8 GiB configuration, with `REIMS_VGPU_LOG=warn` and `REIMS_VGPU_TRACE`.
+Logs under `Build/gpu-timeout-baseline` showed a wait on FIFO 1's completion
+stamp, with queued opcode `0x37` execs. The trace later advanced again, so
+that wait alone does not prove a permanent deadlock or explain the earlier
+GPU timeouts.
+
+`Patches/reims-hvf/0001-Trace-Metal-command-buffer-dependencies.patch` is
+diagnostic work in progress against Reims
+`1fe0acb68b287db36f1e6c7b9f45383940b8a76f`. It adds command-buffer creation,
+commit, wait, signal and completion events to `REIMS_VGPU_TRACE`, including
+CPU-side shared-event signals. It has not been compiled or runtime-tested,
+and is not linked into the current QEMU binary. It does not fix the timeout.
+The native source changes are isolated in `.build/Dependencies/reims-metal-fix`.
+No guest shaders, memory dumps or Apple binaries are included in the patch.
 
 Artifacts under `/Volumes/Zonglin's Disk/VMApple`:
 
@@ -349,8 +437,8 @@ below its existing 100 GiB preparation threshold.
 For macOS, the profile currently targets an installed image with
 `inlineEncryption: false`, such as one made by `pull`. The pinned QEMU always
 advertises a disk without inline encryption; the encrypted Data volume of a
-Linux-restored VM has not been validated with it. `restore` is ported but
-still needs a successful end-to-end restore with the IPSW. `iboot` needs a running
+Linux-restored VM has not been validated with it. `restore` passed end-to-end
+with Ventura 13.6 and the local write-timeout patch above. `iboot` needs a running
 guest with `--usb` enabled and an iBoot recovery device present. `account`
 and custom `--boot-args` remain unsupported on this profile. No
 Virtualization.framework installer has been added.
@@ -358,8 +446,9 @@ Virtualization.framework installer has been added.
 Supply `--rom` explicitly. Upstream's documented HVF boot uses the system's
 `AVPBooter.vmapple2.bin`; this is an Apple boot-ROM dependency, even though
 QEMU executes the guest through Hypervisor.framework. OpenAVB is the ROM
-used by this project's Linux flow; its DFU fallback and RestoreOS chain have
-been tested with this HVF profile. The CLI does not select the Apple ROM automatically. Upstream's
+used by this project's Linux flow; its DFU fallback, RestoreOS chain and
+installed-system boot have been tested with this HVF profile. The CLI does
+not select the Apple ROM automatically. Upstream's
 macOS 14-and-later path also patches the guest kernel's PAC failure waits
 in memory, removing per-process PAC key switching; macOS 13 does not need
 that patch. See the pinned checkout's `docs/system/arm/vmapple.rst` and
@@ -396,7 +485,8 @@ patches retain their original authorship.
 
 | Patches | Project | Licence |
 | --- | --- | --- |
-| `qemu`, `staging/newtree/qemu` | QEMU | GPL-2.0 |
-| `reims`, `staging/reims-guard-old`, `staging/newtree/reims-vgpu` | Reims | GPL-2.0-or-later or LGPL-3.0-or-later |
+| `qemu`, `qemu-hvf`, `staging/newtree/qemu` | QEMU | GPL-2.0 |
+| `reims`, `reims-hvf`, `staging/reims-guard-old`, `staging/newtree/reims-vgpu` | Reims | GPL-2.0-or-later or LGPL-3.0-or-later |
 | `metal2vulkan` | metal2vulkan | GPL-2.0-or-later or LGPL-3.0-or-later |
 | `idevicerestore` | idevicerestore | LGPL-2.1-or-later |
+| `libimobiledevice-glue` | libimobiledevice-glue | LGPL-2.1-or-later |

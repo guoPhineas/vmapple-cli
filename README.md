@@ -59,12 +59,15 @@ vmapple-cli stop vms/sonoma
 
 ## Further Reading and Licence
 
-Apple silicon macOS has an experimental HVF launch profile for installed images.
+Apple silicon macOS has an experimental HVF restore and boot profile.
 It needs a separate Reims/HVF QEMU build; the Homebrew binary checked on the
 development host does not include `vmapple`. OpenAVB has loaded iBSS, iBEC
 and Ventura 13.6 RestoreOS under HVF, with native ticket requests and USB
-restore transport. Full installation and normal macOS startup are still
-being verified; earlier large transfers failed. See
+restore transport. Ventura 13.6 completed installation and reached Setup
+Assistant in the native Reims window on an M3 Pro, with mouse and keyboard
+input verified. This uses OpenAVB without
+reading the system AVPBooter or using Virtualization.framework. GPU timeouts
+and guest crashes remain unresolved. See
 [the HVF status and prerequisites](Documents/Reference.md#apple-silicon-macos-hvf-experimental).
 
 - [Documents/Reference.md](Documents/Reference.md): status of each macOS version, what each command does, the pieces and their commits, licences.

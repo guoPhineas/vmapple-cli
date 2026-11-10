@@ -1,0 +1,134 @@
+diff --git a/crates/reims-vgpu-metal/src/gpu/command.rs b/crates/reims-vgpu-metal/src/gpu/command.rs
+index 8df6d09..1af2b68 100644
+--- a/crates/reims-vgpu-metal/src/gpu/command.rs
++++ b/crates/reims-vgpu-metal/src/gpu/command.rs
+@@ -7,13 +7,14 @@ use block2::RcBlock;
+ use objc2::runtime::ProtocolObject;
+ use objc2_metal::{MTLCommandBuffer, MTLCommandQueue};
+ use reims_vgpu_core::num::ToU64;
+-use reims_vgpu_core::platform::Platform;
+ use reims_vgpu_core::platform::command::{CompletedHandler, CompletedInfo};
+ use reims_vgpu_core::platform::event::EventRef;
+ use reims_vgpu_core::platform::types::{CommandBufferStatus, NsErrorText};
+ use reims_vgpu_core::platform::values::ComputePassDesc;
++use reims_vgpu_core::platform::{Handle, Platform};
+ use reims_vgpu_core::raise::{OnFault, RaiseResult};
+ use reims_vgpu_core::sync::Mutex;
++use reims_vgpu_core::trace;
+ 
+ use crate::gpu::event;
+ use crate::msg::{self, Policy};
+@@ -31,8 +32,12 @@ impl reims_vgpu_core::platform::command::CommandQueue<MetalPlatform> for MetalCo
+         &self,
+         on: OnFault,
+     ) -> RaiseResult<Option<<MetalPlatform as Platform>::CommandBuffer>> {
+-        msg::send("commandBuffer", Policy::On(on), || self.commandBuffer())
+-            .map(|b| b.map(Obj::from_retained))
++        let buffer = msg::send("commandBuffer", Policy::On(on), || self.commandBuffer())
++            .map(|b| b.map(Obj::from_retained))?;
++        if let Some(b) = &buffer {
++            trace::event("mcb", &[b.id().0, self.id().0]);
++        }
++        Ok(buffer)
+     }
+     /// `setLabel:` with a new `NSString` of `label`, released after the call.
+     fn set_label(&self, label: &str) {
+@@ -45,10 +50,16 @@ impl reims_vgpu_core::platform::command::CommandQueue<MetalPlatform> for MetalCo
+ fn completed_info(cb: &ProtocolObject<dyn MTLCommandBuffer>) -> CompletedInfo {
+     let status = msg::get("status", || cb.status());
+     let error = msg::get("error", || cb.error());
+-    CompletedInfo {
++    let info = CompletedInfo {
+         status: CommandBufferStatus(status.0.to_u64()),
+         error: error.as_deref().map(error_text),
++    };
++    let id = std::ptr::from_ref(cb).cast::<u8>().addr().to_u64();
++    trace::event("mcomplete", &[id, info.status.0]);
++    if let Some(error) = &info.error {
++        trace::event_text("merror", &[id], &error.description);
+     }
++    info
+ }
+ 
+ /// `id<MTLCommandBuffer>`.
+@@ -86,7 +97,10 @@ impl reims_vgpu_core::platform::command::CommandBuffer<MetalPlatform> for MetalC
+         .map(|e| e.map(Obj::from_retained))
+     }
+     fn commit(&self, on: OnFault) -> RaiseResult<()> {
+-        msg::send("commit", Policy::On(on), || self.get().commit())
++        trace::event("mcommit", &[self.id().0]);
++        let result = msg::send("commit", Policy::On(on), || self.get().commit());
++        trace::event("mcommitted", &[self.id().0]);
++        result
+     }
+     /// `computeCommandEncoder`: a `+0` encoder, retained.
+     fn compute_encoder(
+@@ -110,6 +124,7 @@ impl reims_vgpu_core::platform::command::CommandBuffer<MetalPlatform> for MetalC
+         event: Option<EventRef<'_, MetalPlatform>>,
+         value: u64,
+     ) -> RaiseResult<()> {
++        trace::event("msignal", &[self.id().0, event.map_or(0, |e| e.id().0), value]);
+         let event = event.map(self::event);
+         msg::send("encodeSignalEvent:value:", Policy::Caught, || {
+             CommandBufferSpi::encodeSignalEvent_value(self.get(), event, value)
+@@ -121,6 +136,14 @@ impl reims_vgpu_core::platform::command::CommandBuffer<MetalPlatform> for MetalC
+         signal_event_scheduled: Option<&<MetalPlatform as Platform>::SharedEvent>,
+         value: u64,
+     ) -> RaiseResult<()> {
++        trace::event(
++            "mscheduledsignal",
++            &[
++                self.id().0,
++                signal_event_scheduled.map_or(0, |e| e.id().0),
++                value,
++            ],
++        );
+         let event = signal_event_scheduled.map(|e| e.get());
+         msg::send("encodeSignalEventScheduled:value:", Policy::Caught, || {
+             self.encodeSignalEventScheduled_value(event, value)
+@@ -132,6 +155,7 @@ impl reims_vgpu_core::platform::command::CommandBuffer<MetalPlatform> for MetalC
+         event: Option<EventRef<'_, MetalPlatform>>,
+         value: u64,
+     ) -> RaiseResult<()> {
++        trace::event("mwait", &[self.id().0, event.map_or(0, |e| e.id().0), value]);
+         let event = event.map(self::event);
+         msg::send("encodeWaitForEvent:value:", Policy::Caught, || {
+             CommandBufferSpi::encodeWaitForEvent_value(self.get(), event, value)
+@@ -170,9 +194,12 @@ impl reims_vgpu_core::platform::command::CommandBuffer<MetalPlatform> for MetalC
+         CommandBufferStatus(msg::get("status", || self.get().status()).0.to_u64())
+     }
+     fn wait_until_completed(&self, on: OnFault) -> RaiseResult<()> {
+-        msg::send("waitUntilCompleted", Policy::On(on), || {
++        trace::event("mcwait", &[self.id().0]);
++        let result = msg::send("waitUntilCompleted", Policy::On(on), || {
+             self.waitUntilCompleted()
+-        })
++        });
++        trace::event("mcwaited", &[self.id().0]);
++        result
+     }
+     fn wait_until_scheduled(&self) -> RaiseResult<()> {
+         msg::send("waitUntilScheduled", Policy::Caught, || {
+diff --git a/crates/reims-vgpu-metal/src/gpu/event.rs b/crates/reims-vgpu-metal/src/gpu/event.rs
+index 4f3f2d3..0e7217e 100644
+--- a/crates/reims-vgpu-metal/src/gpu/event.rs
++++ b/crates/reims-vgpu-metal/src/gpu/event.rs
+@@ -2,8 +2,9 @@
+ 
+ use objc2::runtime::ProtocolObject;
+ use objc2_metal::{MTLEvent, MTLSharedEvent, MTLSharedEventHandle, MTLSharedEventListener};
+-use reims_vgpu_core::platform::Platform;
++use reims_vgpu_core::platform::{Handle, Platform};
+ use reims_vgpu_core::raise::RaiseResult;
++use reims_vgpu_core::trace;
+ 
+ use crate::msg::{self, Policy};
+ use crate::platform::{MetalPlatform, Obj};
+@@ -24,6 +25,7 @@ impl reims_vgpu_core::platform::event::SharedEvent<MetalPlatform> for MetalShare
+         .map(Obj::from_retained)
+     }
+     fn set_signaled_value(&self, signaled_value: u64) -> RaiseResult<()> {
++        trace::event("mcpusignal", &[self.id().0, signaled_value]);
+         msg::send("setSignaledValue:", Policy::Caught, || {
+             self.setSignaledValue(signaled_value)
+         })
