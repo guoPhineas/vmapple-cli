@@ -21,6 +21,8 @@ public enum SocketError: Error, CustomStringConvertible {
 /// A blocking Unix stream socket.
 public final class UnixSocket: @unchecked Sendable {
     let descriptor: Int32
+    private let closeLock = NSLock()
+    private var didClose = false
 
     init(descriptor: Int32) {
         self.descriptor = descriptor
@@ -66,6 +68,7 @@ public final class UnixSocket: @unchecked Sendable {
     public func accept() throws -> UnixSocket {
         let client = systemAccept(descriptor, nil, nil)
         guard client >= 0 else { throw SocketError.system("accept", errno) }
+        try Self.suppressBrokenPipeSignal(client)
         return UnixSocket(descriptor: client)
     }
 
@@ -130,6 +133,10 @@ public final class UnixSocket: @unchecked Sendable {
     }
 
     public func close() {
+        closeLock.lock()
+        defer { closeLock.unlock() }
+        guard !didClose else { return }
+        didClose = true
         shutdown(descriptor, Int32(SHUT_RDWR))
         systemClose(descriptor)
     }
@@ -137,7 +144,21 @@ public final class UnixSocket: @unchecked Sendable {
     private static func makeSocket() throws -> Int32 {
         let descriptor = socket(AF_UNIX, streamType, 0)
         guard descriptor >= 0 else { throw SocketError.system("socket", errno) }
+        try suppressBrokenPipeSignal(descriptor)
         return descriptor
+    }
+
+    private static func suppressBrokenPipeSignal(_ descriptor: Int32) throws {
+        #if canImport(Darwin)
+        // Darwin has no MSG_NOSIGNAL; apply this to accepted sockets too.
+        var enabled: Int32 = 1
+        guard setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &enabled,
+                         socklen_t(MemoryLayout.size(ofValue: enabled))) == 0 else {
+            let code = errno
+            systemClose(descriptor)
+            throw SocketError.system("setsockopt(SO_NOSIGPIPE)", code)
+        }
+        #endif
     }
 
     private static func makeAddress(path: String) -> sockaddr_un {

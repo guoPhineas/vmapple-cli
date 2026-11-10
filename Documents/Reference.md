@@ -157,6 +157,237 @@ links libtatsu, libplist and the Swift runtime in. Which hosts should work:
 See [Documents/Research/restore-on-linux.md](Research/restore-on-linux.md)
 for how each stage works and what was measured.
 
+## Apple silicon macOS / HVF (experimental)
+
+The CLI selects HVF on macOS and keeps KVM on Linux. The HVF profile targets
+steelbrain's Reims/QEMU pair, which supplies `vmapple` and `apple-gfx-mmio`
+using Reims's Metal backend. It does not use the Linux integration's
+`gfx-device`, `vendor-legacy-features`, CPU-affinity or PAC/handoff
+environment settings. `--window` enables Reims's guest window; otherwise the
+guest stays headless and can be driven through QMP.
+`--usb` exposes the restore USB channel when using the QEMU integration
+patch below; `restore` enables it automatically.
+
+Local checks on 2026-11-10: Apple M3 Pro, 18 GiB RAM, macOS 27.2 (26B123),
+Swift 6.4.2. `kern.hv_support` is 1. Swift compilation and the tests passed;
+the two tests that need real image inputs were skipped. The installed Homebrew
+QEMU 11.1.3 lists `hvf` and `tcg`, but has no `vmapple` machine. A separate
+source build, QEMU 11.1.50, ran OpenAVB to its DFU-ready message as described
+below. Ventura 13.6 RestoreOS has run, but a complete installation and normal
+macOS startup have not yet passed with this profile.
+
+Independent shallow clones, with no submodules initialized, are kept under
+the ignored `.build/Dependencies` directory:
+
+| Directory | Source | Commit |
+| --- | --- | --- |
+| `qemu-hvf` | `https://github.com/steelbrain/qemu-reims-vgpu`, branch `steelbrain/reims-vgpu` | `1b41f5f5db4d1067d023973b9bd74c7b341e0d28` |
+| `reims-vgpu` | `https://github.com/steelbrain/reims-vgpu`, branch `master` | `1fe0acb68b287db36f1e6c7b9f45383940b8a76f` |
+| `OpenAVB` | `https://github.com/owngoal-dev/OpenAVB`, branch `vmapple` | `c35e41701ab28f02ebe7747abb79c29e905fb2d2` |
+
+QEMU is checked out at the commit recorded by that Reims checkout, rather
+than the branch tip. The QEMU fork's release API returned no releases, so
+the user authorized Python for third-party QEMU build tools only. The CLI
+and its VM launch do not invoke Python. Rust 1.98.1 was installed locally
+under `~/.cargo` and `~/.rustup`, with the minimal profile and without changing
+shell startup files. Homebrew installed lld 23.1.5 and its LLVM 23.1.5 and
+Z3 5.3.3 dependencies; the existing lz4 1.10.0 was unchanged.
+
+Reims's Metal distribution and the OpenAVB ROM were built. OpenAVB's
+`OpenAVB.bin` target uses C, assembly, lld and objcopy only; its other targets
+were not run. Reims's jemalloc dependency failed because its generated
+`config.status` put the external volume's apostrophe into an unescaped
+single-quoted `ac_pwd`. A symlink did not hide the physical path. The same
+crate's bundled jemalloc was built under `/private/tmp/vmapple-jemalloc-build`
+with `_rjem_` prefixes, the zone allocator disabled, and `-fno-common`, then
+selected through the crate's supported `JEMALLOC_OVERRIDE` environment
+variable. Reims's archive-symbol isolation check passed. No dependency
+source was patched for this workaround.
+
+Reims used Rust 1.98.1, `CARGO_BUILD_JOBS=6`,
+`CARGO_TARGET_DIR=/private/tmp/vmapple-hvf-work/Build/reims-target` and
+`cargo xtask dist` (Metal). Cargo regenerated the upstream lock file; the
+resulting `Cargo.lock` SHA-256 is
+`e686415c02d199bc0e11bcaad294455cea1cf98a53a232d144e6707f96e6ae83`.
+The temporary path `/private/tmp/vmapple-hvf-work` is a symlink to
+`/Volumes/Zonglin's Disk/VMApple`; the artifacts live on the external disk.
+
+QEMU's Python virtual environment also resolved the external volume's
+physical path and failed in configure. QEMU was therefore built in the
+local `.build/qemu-hvf-build` directory, with debug information disabled,
+and its executable copied to the external disk. Configure used the Reims
+distribution's `lib/pkgconfig` directory and:
+
+```sh
+configure --target-list=aarch64-softmmu --enable-hvf --enable-pvg \
+  --enable-gnutls --enable-fdt --disable-docs --disable-sdl --disable-gtk \
+  --disable-vnc --disable-slirp --disable-rust --disable-werror -Ddebug=false
+ninja -j6 qemu-system-aarch64
+```
+
+Python 3.15.2 was used by the QEMU build. The resulting executable lists
+`vmapple`, `hvf`, `tcg` and `apple-gfx-mmio`. Its direct dynamic dependencies
+include Hypervisor.framework, Metal and Homebrew libraries, with no Python,
+Virtualization.framework or ParavirtualizedGraphics.framework dependency;
+Reims is linked statically. Strict code-signature verification passed with
+the public `com.apple.security.hypervisor` entitlement, after removing
+FinderInfo and ResourceFork metadata from the generated executables.
+
+### Measured HVF startup
+
+Two stages were run on 2026-11-10:
+
+1. Homebrew QEMU 11.1.3, `virt,gic-version=3`, HVF with the in-kernel GIC,
+   one vCPU and 128 MiB RAM: a self-built AArch64 ELF wrote
+   `VMAPPLE_HVF_CPU_OK` to PL011 and waited. QMP reported `running`; QMP
+   `quit` ended QEMU with status 0. This checks CPU execution without Apple
+   guest software, not VMApple compatibility.
+2. The built QEMU 11.1.50, started by this CLI's `boot`, `vmapple`,
+   `hvf,kernel-irqchip=on`, one vCPU, 2 GiB file-backed RAM and the built
+   OpenAVB ROM, with a dedicated blank 1 GiB sparse root disk and blank AUX.
+   Only this empty smoke VM was marked `inlineEncryption: false` for the
+   launch profile; no installed disk's encryption settings were changed.
+   It started paused, QMP reported `prelaunch`, and after `cont` the serial
+   console printed:
+
+   ```text
+   OpenBootROM: [boot] runtime and storage ready
+   OpenBootROM: virtual firmware unavailable; falling back to DFU
+   OpenBootROM: [dfu] ready for image upload
+   ```
+
+   QMP then reported `running`, the CPU register dump showed execution in
+   the ROM, and QMP `quit` ended the CLI/QEMU run with status 0. Reims
+   initialized its Metal device on Apple M3 Pro and created display port 0;
+   no accelerated guest frame was tested. The startup was repeated with
+   the external disk's real path, including its space and apostrophe,
+   with the same result. Neither run read the system AVPBooter.
+
+QEMU itself needed no source patch for those two initial startup checks.
+The firmware reporting DFU-ready alone did not prove a USB upload works.
+No system security setting was changed.
+
+### Restore transport bring-up
+
+The next local integration applies
+`Patches/qemu-hvf/0001-Add-the-restore-USB-link-and-OpenAVB-RAM.patch` to the
+pinned QEMU above. It ports this project's existing restore USB device,
+whole-disk discard, writable backdoor and scratch RAM patches to the native
+HVF/Reims tree. Scratch RAM is mapped after the GPU takes its RAM map.
+The patch reverse-applied cleanly with `git apply --reverse --check` against
+the built tree. The rebuilt external QEMU's SHA-256 is
+`62ea1c2e914f0d7146a30edbe8020f343066928c2c8e6b5ee937f51fda534c77`;
+the earlier hash in the artifact table identifies the initial unpatched
+startup experiment.
+
+Measured with `boot --usb`, OpenAVB, one vCPU and 2 GiB RAM: the Swift
+`LiveUSBTests.enumeratesOpenAVBDFU` test reset the USB link, read the device
+and string descriptors, and saw vendor `05ac`, product `1227`, `CPID:FE00`
+and `BDID:20`. Its full ECID matched `vm.json`. Both this live test and the
+CLI/QEMU exit passed. This verifies control transfers and identity, not an
+iBSS image upload. The result is in the smoke VM's `hvf-check.json`.
+
+The macOS ticket bridge now links Homebrew libtatsu 1.1.0 and libplist, and
+the native restore dependencies were installed: libimobiledevice 1.4.0,
+libirecovery 1.3.1, libusbmuxd 2.1.1 and LZFSE 1.0. The build also installed
+libimobiledevice-glue and automake, and upgraded its M4/Autoconf and CA
+certificate dependencies. No global usbmuxd service was started; the CLI
+serves its own per-VM Unix socket.
+
+idevicerestore was independently cloned at
+`6cead6bce881ce7bcc6878852f292de8050e20e6`, with this project's
+`Patches/idevicerestore/0001-Request-macOS-tickets-in-restore-mode.patch`,
+built with Autotools and C under `.build/idevicerestore-build`, and installed
+at `Build/restore-tools/bin/idevicerestore` on the external disk. Its SHA-256
+is `3b1262ca495b591c4e1165b92232ba2ca2c2149113757310bc18ed8b8a438346`.
+It lists `--restore-mode` and `--ticket`; neither it nor the CLI links Python.
+The normal Swift test run passed with the live test disabled; the live test
+was run separately against the real HVF guest, including the ECID check.
+
+An independent 64 GiB sparse VM was created at
+`vms/ventura-13.6-hvf`, with `inlineEncryption: false`. Existing VMs were
+not erased. The downloaded `UniversalMac_13.6_22G120_Restore.ipsw` is at
+`/Volumes/Zonglin's Disk/ipsws/`, size 12,893,555,341 bytes, SHA-256
+`9bf095739b8b2d5ebd20f7e8de938f10bc449f9843de21c4a41ae54d73526728`.
+Restore now checks QEMU's required USB capability before resetting either
+disk, and throws if RestoreOS does not reset within its completion timeout.
+
+Actual restore attempts used one vCPU and 8 GiB RAM. Native ticket requests
+returned a 5,504-byte AP ticket; iBSS, iBEC and RestoreOS ran, and the guest
+reported `VirtualMac2,1` with the expected full 64-bit ECID. The main
+filesystem transfer and verification completed. Subsequent attempts failed
+during Cryptex or BaseSystem transfers; installation has not completed.
+The first attempt also exposed Darwin SIGPIPE and repeated socket-close
+problems, now guarded by `SO_NOSIGPIPE` and idempotent close.
+
+Transport diagnostics observed a full receive window while libimobiledevice's
+send path timed out. The mux now acknowledges window-only packets, matching
+upstream usbmuxd's `device_tcp_input`. Data sends and ACKs are serialized per
+connection, with sequence space reserved before USB I/O; previously another
+thread could emit an ACK with an old sequence number. A Unix-socket test
+checks the emitted ACKs and sequence ordering while USB completion is delayed.
+All 46 tests in 17 suites passed (tests needing optional real images were
+skipped). Another complete restore is running with these fixes; its result
+and normal startup remain unverified. Prior attempt logs are preserved under
+`Build/restore-attempt-*` on the external disk. These observations do not yet
+prove the sole cause of every failed transfer.
+
+Artifacts under `/Volumes/Zonglin's Disk/VMApple`:
+
+| Path | Result |
+| --- | --- |
+| `Build/qemu/qemu-system-aarch64` | QEMU 11.1.50 with restore patches; SHA-256 `62ea1c2e914f0d7146a30edbe8020f343066928c2c8e6b5ee937f51fda534c77` (initial unpatched startup build: `52c90039f3665b88ec5d88337343d16b91b81e6ed476454ae4d38cb939cb4c90`) |
+| `Build/openavb/OpenAVB.bin` | About 449 KiB; SHA-256 `cd9deec3082c90379107d12c700c55625d73e26301f4a9e151f4c0fdd2378670` |
+| `Build/reims-target/dist/lib/libreims_vgpu.a` | Metal backend; SHA-256 `472ab71e8cf3b11f23101fc6a13586df2456f1191f1aeda1c5a5365226ba4924` |
+| `Build/qemu-configure.log`, `Build/qemu-build.log`, `Build/reims-build.log` | Build output |
+| `vms/hvf-openavb-smoke/serial.log`, `vms/hvf-openavb-smoke/hvf-check.json` | Final startup's serial console, QMP status, registers and exit status |
+
+`doctor` passed its host, HVF and QEMU capability checks. It still returned
+failure for free space: about 89.4 GB remained on the external volume,
+below its existing 100 GiB preparation threshold.
+
+For macOS, the profile currently targets an installed image with
+`inlineEncryption: false`, such as one made by `pull`. The pinned QEMU always
+advertises a disk without inline encryption; the encrypted Data volume of a
+Linux-restored VM has not been validated with it. `restore` is ported but
+still needs a successful end-to-end restore with the IPSW. `iboot` needs a running
+guest with `--usb` enabled and an iBoot recovery device present. `account`
+and custom `--boot-args` remain unsupported on this profile. No
+Virtualization.framework installer has been added.
+
+Supply `--rom` explicitly. Upstream's documented HVF boot uses the system's
+`AVPBooter.vmapple2.bin`; this is an Apple boot-ROM dependency, even though
+QEMU executes the guest through Hypervisor.framework. OpenAVB is the ROM
+used by this project's Linux flow; its DFU fallback and RestoreOS chain have
+been tested with this HVF profile. The CLI does not select the Apple ROM automatically. Upstream's
+macOS 14-and-later path also patches the guest kernel's PAC failure waits
+in memory, removing per-process PAC key switching; macOS 13 does not need
+that patch. See the pinned checkout's `docs/system/arm/vmapple.rst` and
+Reims's `docs/qemu.md` for those boundaries.
+
+Once a compatible QEMU binary, an installed VM and a chosen ROM are available:
+
+```sh
+vmapple-cli doctor --qemu /path/to/reims-qemu-system-aarch64
+vmapple-cli boot "/Volumes/Zonglin's Disk/VMApple/ventura" \
+  --qemu /path/to/reims-qemu-system-aarch64 --rom /path/to/boot-rom \
+  --cpus 4 --memory 8 --window --dry-run
+```
+
+`--dry-run` only reads `vm.json` and prints a shell-quoted launch command.
+It does not check QEMU capabilities or start a VM. A real boot checks QEMU's
+machine, accelerator and graphics-device help before removing runtime files.
+`doctor` checks free space in its working directory, not the VM's directory;
+the existing 100 GiB preparation threshold is unchanged.
+
+The first proposed IPSW is Ventura 13.6 (22G120), which upstream records on
+an M3 Max. Apple's CDN answered HTTP 200 on 2026-11-10 for
+`UniversalMac_13.6_22G120_Restore.ipsw`, 12,893,555,341 bytes, with SHA-256
+`9bf095739b8b2d5ebd20f7e8de938f10bc449f9843de21c4a41ae54d73526728`
+in its response headers. This was a HEAD request only; the IPSW has not been
+downloaded, and signing eligibility has not been tested. The user supplies
+the IPSW and keeps VM storage on `Zonglin's Disk`.
+
 ## Licence
 
 vmapple-cli is under the [MIT License](../LICENSE). Each series in `Patches/`

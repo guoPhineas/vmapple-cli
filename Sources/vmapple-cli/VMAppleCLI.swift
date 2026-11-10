@@ -6,7 +6,7 @@ import VMAppleKit
 struct VMAppleCLI: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "vmapple-cli",
-        abstract: "Virtual Macs on arm64 Linux with KVM.",
+        abstract: "Virtual Macs with QEMU: KVM on arm64 Linux, HVF on Apple silicon macOS.",
         subcommands: [Doctor.self, Probe.self, Create.self, Pull.self, Restore.self, Account.self, Boot.self, Screenshot.self, Click.self, Press.self, IBoot.self, Stop.self]
     )
 }
@@ -16,8 +16,11 @@ struct VMAppleCLI: ParsableCommand {
 struct Doctor: ParsableCommand {
     static let configuration = CommandConfiguration(abstract: "Check this host.")
 
+    @Option(help: "QEMU executable to inspect without starting a VM.")
+    var qemu = ProcessInfo.processInfo.environment["VMAPPLE_QEMU"] ?? "qemu-system-aarch64"
+
     func run() throws {
-        let checks = HostChecks.all()
+        let checks = HostChecks.all() + [HostChecks.qemu(executable: qemu)]
         for check in checks {
             print("\(check.state.rawValue.padding(toLength: 8, withPad: " ", startingAt: 0))\(check.name.padding(toLength: 10, withPad: " ", startingAt: 0))\(check.detail)")
         }
@@ -33,6 +36,9 @@ struct Probe: ParsableCommand {
     static let configuration = CommandConfiguration(abstract: "Run a throwaway KVM guest on each kind of core.")
 
     func run() throws {
+        guard QEMUAccelerator.host == .kvm else {
+            throw ValidationError("probe runs a Linux KVM guest; use doctor to check an Apple silicon host")
+        }
         let kinds = HostCores.current()
         guard !kinds.isEmpty else {
             print("no CPU parts in /proc/cpuinfo")
@@ -72,20 +78,29 @@ struct Probe: ParsableCommand {
 // MARK: - machine options
 
 struct MachineOptions: ParsableArguments {
-    @Option(help: "QEMU built with Patches/qemu.")
+    @Option(help: "Patched QEMU: the KVM build on Linux or the Reims/HVF build on macOS.")
     var qemu = ProcessInfo.processInfo.environment["VMAPPLE_QEMU"] ?? "qemu-system-aarch64"
 
-    @Option(help: "OpenAVB's ROM, branch vmapple.")
-    var rom = ProcessInfo.processInfo.environment["VMAPPLE_ROM"] ?? "OpenAVB.bin"
+    @Option(help: "Boot ROM. OpenAVB on Linux; an explicitly supplied HVF-compatible ROM on macOS.")
+    var rom = ProcessInfo.processInfo.environment["VMAPPLE_ROM"] ?? (QEMUAccelerator.host == .kvm ? "OpenAVB.bin" : "")
 
-    @Option(help: "Virtual CPUs, all on the host's fastest core kind.")
+    @Option(help: "Virtual CPUs. KVM runs them on the host's fastest core kind.")
     var cpus = 4
 
     @Option(help: "Guest memory in GiB.")
     var memory = 8
 
+    @Flag(help: "Open the Reims guest display window.")
+    var window = false
+
+    @Flag(help: "Expose the virtual USB link for DFU and iBoot recovery.")
+    var usb = false
+
     func options(bootArguments: String) -> QEMUOptions {
-        QEMUOptions(executable: qemu, rom: rom, cpus: cpus, memoryGiB: memory, bootArguments: bootArguments)
+        var options = QEMUOptions(executable: qemu, rom: rom, cpus: cpus, memoryGiB: memory, bootArguments: bootArguments)
+        options.showsWindow = window
+        options.usbDeviceMode = usb || options.accelerator == .kvm
+        return options
     }
 }
 
@@ -101,7 +116,8 @@ struct Create: ParsableCommand {
     var disk: UInt64 = 64
 
     func run() throws {
-        let machine = try VirtualMachine.create(at: URL(fileURLWithPath: path), diskGiB: disk)
+        let machine = try VirtualMachine.create(at: URL(fileURLWithPath: path), diskGiB: disk,
+                                                inlineEncryption: QEMUAccelerator.host == .hvf ? false : nil)
         print("Created \(machine.directory.path), ECID \(String(machine.configuration.ecid, radix: 16))")
     }
 }
@@ -188,6 +204,9 @@ struct Account: ParsableCommand {
     @OptionGroup var machineOptions: MachineOptions
 
     func run() throws {
+        guard QEMUAccelerator.host == .kvm else {
+            throw ValidationError("account currently needs Linux/KVM single-user boot support")
+        }
         guard let password = ProcessInfo.processInfo.environment["VMAPPLE_PASSWORD"], !password.isEmpty else {
             throw ValidationError("Set VMAPPLE_PASSWORD to the account's password.")
         }
@@ -208,7 +227,10 @@ struct Boot: ParsableCommand {
     var path: String
 
     @Option(parsing: .unconditional, help: "Kernel boot arguments.")
-    var bootArgs = "-v serial=11 debug=0x14c \(QEMUOptions.debugAckTimeoutBootArguments)"
+    var bootArgs = QEMUOptions.defaultBootArguments
+
+    @Flag(help: "Print the launch command without starting QEMU or modifying the VM.")
+    var dryRun = false
 
     @Option(help: "Stop after this many seconds. By default, runs until the guest stops.")
     var seconds: Int?
@@ -221,6 +243,10 @@ struct Boot: ParsableCommand {
     func run() throws {
         let machine = try VirtualMachine.open(at: URL(fileURLWithPath: path))
         let options = machineOptions.options(bootArguments: bootArgs)
+        if dryRun {
+            print(QEMUMachine(machine: machine, options: options).launchDescription)
+            return
+        }
         if let seconds {
             let qemu = QEMUMachine(machine: machine, options: options)
             try qemu.start()

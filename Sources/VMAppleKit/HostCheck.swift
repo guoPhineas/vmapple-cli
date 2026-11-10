@@ -1,4 +1,7 @@
 import Foundation
+#if os(macOS)
+import Darwin
+#endif
 
 // MARK: - Checks
 
@@ -18,7 +21,11 @@ public enum HostChecks {
     static let minimumFreeBytes: Int64 = 100 * 1024 * 1024 * 1024
 
     public static func all() -> [HostCheck] {
+        #if os(macOS)
+        [architecture(), hypervisor(), disk()]
+        #else
         [architecture(), kvm(), pointerAuthentication(), vulkan(), disk()]
+        #endif
     }
 
     static func architecture() -> HostCheck {
@@ -27,8 +34,68 @@ public enum HostChecks {
         let name = field(of: system.sysname)
         let machine = field(of: system.machine)
         let release = field(of: system.release)
+        #if os(macOS)
+        let ok = name == "Darwin" && machine == "arm64"
+        #else
         let ok = name == "Linux" && machine == "aarch64"
+        #endif
         return HostCheck(name: "host", state: ok ? .ok : .missing, detail: "\(name) \(machine) \(release)")
+    }
+
+    #if os(macOS)
+    static func hypervisor() -> HostCheck {
+        var supported: Int32 = 0
+        var size = MemoryLayout.size(ofValue: supported)
+        guard sysctlbyname("kern.hv_support", &supported, &size, nil, 0) == 0 else {
+            return HostCheck(name: "hvf", state: .missing, detail: "cannot query kern.hv_support: \(String(cString: strerror(errno)))")
+        }
+        return HostCheck(name: "hvf", state: supported == 1 ? .ok : .missing,
+                         detail: supported == 1 ? "hardware virtualization available; QEMU also needs the hypervisor entitlement" : "hardware virtualization unavailable")
+    }
+    #endif
+
+    /// Inspects QEMU's help output without creating a VM or touching its disks.
+    public static func qemu(executable: String, accelerator: QEMUAccelerator = .host,
+                            usbDeviceMode: Bool = false) -> HostCheck {
+        do {
+            let machines = try qemuOutput(executable, arguments: ["-machine", "help"])
+            guard machines.status == 0, machines.text.split(separator: "\n").contains(where: {
+                $0.split(whereSeparator: \.isWhitespace).first == "vmapple"
+            }) else {
+                return HostCheck(name: "qemu", state: .missing, detail: "\(executable) has no vmapple machine; use the matching patched QEMU build")
+            }
+            let accelerators = try qemuOutput(executable, arguments: ["-accel", "help"])
+            guard accelerators.status == 0, accelerators.text.split(whereSeparator: \.isWhitespace).contains(Substring(accelerator.rawValue)) else {
+                return HostCheck(name: "qemu", state: .missing, detail: "\(executable) has no \(accelerator.rawValue) accelerator")
+            }
+            let device = accelerator == .hvf ? "apple-gfx-mmio" : "reims-vgpu-mmio"
+            let graphics = try qemuOutput(executable, arguments: ["-device", "\(device),help"])
+            guard graphics.status == 0, graphics.text.contains(device) else {
+                return HostCheck(name: "qemu", state: .missing, detail: "\(executable) has no \(device) device")
+            }
+            if usbDeviceMode {
+                let usb = try qemuOutput(executable, arguments: ["-device", "vresearch-vusb-pci,help"])
+                guard usb.status == 0, usb.text.contains("vresearch-vusb-pci") else {
+                    return HostCheck(name: "qemu", state: .missing, detail: "\(executable) has no restore USB transport")
+                }
+            }
+            return HostCheck(name: "qemu", state: .ok, detail: "\(executable): vmapple, \(accelerator.rawValue), \(device); help inspection only")
+        } catch {
+            return HostCheck(name: "qemu", state: .missing, detail: "cannot inspect \(executable): \(error)")
+        }
+    }
+
+    private static func qemuOutput(_ executable: String, arguments: [String]) throws -> (status: Int32, text: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = [executable] + arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (process.terminationStatus, String(decoding: data, as: UTF8.self))
     }
 
     static func kvm() -> HostCheck {

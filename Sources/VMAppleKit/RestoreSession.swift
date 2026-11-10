@@ -37,7 +37,10 @@ public final class RestoreSession: @unchecked Sendable {
         self.machine = machine
         self.firmware = firmware
         var options = options
-        options.bootArguments = Self.bootArguments
+        // HVF receives these through iBEC's setenv command below; its QEMU
+        // build does not implement the KVM boot-argument environment hook.
+        options.bootArguments = options.accelerator == .kvm ? Self.bootArguments : ""
+        options.usbDeviceMode = true
         options.handoffAddresses = (try? firmware.handoffAddresses(for: "iBEC")) ?? []
         options.allowsReboot = false
         qemu = QEMUMachine(machine: machine, options: options)
@@ -46,6 +49,8 @@ public final class RestoreSession: @unchecked Sendable {
     }
 
     public func run() throws {
+        // Refuse an incompatible executable before erasing either disk.
+        try qemu.validate()
         try machine.resetDisks()
         try qemu.start()
         defer { qemu.stop() }
@@ -152,7 +157,7 @@ public final class RestoreSession: @unchecked Sendable {
 
     private func runRestore(link: VUSBLink, bootStage: Int, nonces: DeviceNonces) throws {
         try link.waitForStageChange(after: bootStage, timeout: 300)
-        let server = try USBMuxServer(socketPath: machine.muxSocket.path)
+        let server = try USBMuxServer(socketPath: machine.muxSocket.path, log: log)
         defer { server.close() }
         // The restore OS brings its controller up more than once.
         let serving = Thread { [log] in
@@ -172,8 +177,11 @@ public final class RestoreSession: @unchecked Sendable {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        // idevicerestore also creates a timestamped log in its working directory.
+        process.currentDirectoryURL = machine.directory
         process.arguments = [
-            idevicerestore, "--erase", "--no-input", "--restore-mode",
+            idevicerestore.contains("/") ? URL(fileURLWithPath: idevicerestore).path : idevicerestore,
+            "--erase", "--no-input", "--restore-mode",
             "--ticket", machine.ticket.path,
             "--ecid", "0x" + String(ecid, radix: 16),
             firmware.directory.path,
@@ -206,10 +214,14 @@ public final class RestoreSession: @unchecked Sendable {
         let monitor = try qemu.connectMonitor(timeout: 10)
         defer { monitor.close() }
         let deadline = Date(timeIntervalSinceNow: 180)
-        while Date() < deadline, try monitor.isRunning() {
+        while Date() < deadline {
+            if try !monitor.isRunning() {
+                log("Restore finished")
+                return
+            }
             sleep(2)
         }
-        log("Restore finished")
+        throw QEMUError.timeout("the restore OS to reset after installing macOS")
     }
 
     // MARK: - iBoot

@@ -1,0 +1,1254 @@
+VMApple restore support for the pinned macOS/HVF QEMU tree
+
+Base: 1b41f5f5db4d1067d023973b9bd74c7b341e0d28
+Ported from this project's QEMU patches 0001, 0002, 0003 and 0007,
+originally by Lakr, with original co-authorship retained in those patches.
+The scratch RAM is mapped after the Reims GPU takes its memory map.
+This is a local experimental integration, not an upstream submission.
+The changes retain the QEMU sources' GPL-2.0-or-later licence.
+
+diff --git a/hw/block/virtio-blk.c b/hw/block/virtio-blk.c
+index 61c341c..fad5ef7 100644
+--- a/hw/block/virtio-blk.c
++++ b/hw/block/virtio-blk.c
+@@ -380,7 +380,9 @@ static uint8_t virtio_blk_handle_discard_write_zeroes(VirtIOBlockReq *req,
+     uint64_t sector;
+     uint32_t num_sectors, flags, max_sectors;
+     uint8_t err_status;
+-    int bytes;
++    int64_t bytes;
++    bool oversized_discard = !is_write_zeroes &&
++                             VIRTIO_BLK_GET_CLASS(s)->oversized_discard;
+ 
+     sector = virtio_ldq_p(vdev, &dwz_hdr->sector);
+     num_sectors = virtio_ldl_p(vdev, &dwz_hdr->num_sectors);
+@@ -393,14 +395,23 @@ static uint8_t virtio_blk_handle_discard_write_zeroes(VirtIOBlockReq *req,
+      * make us sure that "num_sectors << BDRV_SECTOR_BITS" can fit in
+      * the integer variable.
+      */
+-    if (unlikely(num_sectors > max_sectors)) {
++    if (unlikely(num_sectors > max_sectors && !oversized_discard)) {
+         err_status = VIRTIO_BLK_S_IOERR;
+         goto err;
+     }
+ 
+-    bytes = num_sectors << BDRV_SECTOR_BITS;
++    bytes = (int64_t)num_sectors << BDRV_SECTOR_BITS;
+ 
+-    if (unlikely(!virtio_blk_sect_range_ok(s, sector, bytes))) {
++    if (num_sectors > max_sectors) {
++        uint64_t total_sectors;
++
++        blk_get_geometry(s->blk, &total_sectors);
++        if (sector & s->sector_mask || sector > total_sectors ||
++            num_sectors > total_sectors - sector) {
++            err_status = VIRTIO_BLK_S_IOERR;
++            goto err;
++        }
++    } else if (unlikely(!virtio_blk_sect_range_ok(s, sector, bytes))) {
+         err_status = VIRTIO_BLK_S_IOERR;
+         goto err;
+     }
+diff --git a/hw/virtio/virtio-pci.c b/hw/virtio/virtio-pci.c
+index c73f1f5..68374d9 100644
+--- a/hw/virtio/virtio-pci.c
++++ b/hw/virtio/virtio-pci.c
+@@ -1711,6 +1711,12 @@ static void virtio_pci_common_write(void *opaque, hwaddr addr,
+             proxy->vqs[vdev->queue_sel].enabled = 1;
+             proxy->vqs[vdev->queue_sel].reset = 0;
+             virtio_queue_enable(vdev, vdev->queue_sel);
++        } else if (val == 0 &&
++                   (proxy->flags & VIRTIO_PCI_FLAG_ALLOW_QUEUE_DISABLE)) {
++            if (proxy->vqs[vdev->queue_sel].enabled) {
++                virtio_queue_reset(vdev, vdev->queue_sel);
++                proxy->vqs[vdev->queue_sel].enabled = 0;
++            }
+         } else {
+             virtio_error(vdev, "wrong value for queue_enable %"PRIx64, val);
+         }
+diff --git a/hw/virtio/virtio.c b/hw/virtio/virtio.c
+index c9f9e5b..641e1b1 100644
+--- a/hw/virtio/virtio.c
++++ b/hw/virtio/virtio.c
+@@ -204,7 +204,9 @@ const char *virtio_device_names[] = {
+ 
+ static const char *virtio_id_to_name(uint16_t device_id)
+ {
+-    assert(device_id < G_N_ELEMENTS(virtio_device_names));
++    if (device_id >= G_N_ELEMENTS(virtio_device_names)) {
++        return "vendor";
++    }
+     const char *name = virtio_device_names[device_id];
+     assert(name != NULL);
+     return name;
+diff --git a/hw/vmapple/bdif.c b/hw/vmapple/bdif.c
+index 4dc10c1..c1494df 100644
+--- a/hw/vmapple/bdif.c
++++ b/hw/vmapple/bdif.c
+@@ -189,9 +189,22 @@ static void vblk_cmd(uint64_t devid, BlockBackend *blk, uint64_t gp_addr,
+         }
+         break;
+     case VBLK_DATA_FLAGS_WRITE:
+-        /* Not needed, iBoot only reads */
++        dma_result = dma_memory_read(&address_space_memory, req.data.addr, buf,
++                                     req.data.len, MEMTXATTRS_UNSPECIFIED);
++        if (dma_result != MEMTX_OK) {
++            goto out;
++        }
++        r = blk_pwrite(blk, off, req.data.len, buf, 0);
++        trace_bdif_vblk_write(devid == DEVID_AUX ? "aux" : "root",
++                              req.data.addr, off, req.data.len, r);
++        if (r < 0) {
++            goto out;
++        }
++        ret = VBLK_RET_SUCCESS;
+         break;
+     default:
++        qemu_log_mask(LOG_UNIMP, "%s: unknown data flags 0x%" PRIx32 "\n",
++                      __func__, req.data.flags);
+         break;
+     }
+ 
+@@ -245,6 +258,21 @@ static void bdif_init(Object *obj)
+     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio);
+ }
+ 
++static void bdif_realize(DeviceState *dev, Error **errp)
++{
++    VMAppleBdifState *s = VMAPPLE_BDIF(dev);
++    BlockBackend *blks[] = { s->aux, s->root };
++
++    /* iBoot from macOS 27 writes through the backdoor as well as reading. */
++    for (size_t i = 0; i < ARRAY_SIZE(blks); i++) {
++        if (blks[i] &&
++            blk_set_perm(blks[i], BLK_PERM_CONSISTENT_READ | BLK_PERM_WRITE,
++                         BLK_PERM_ALL, errp) < 0) {
++            return;
++        }
++    }
++}
++
+ static const Property bdif_properties[] = {
+     DEFINE_PROP_DRIVE("aux", VMAppleBdifState, aux),
+     DEFINE_PROP_DRIVE("root", VMAppleBdifState, root),
+@@ -255,6 +283,7 @@ static void bdif_class_init(ObjectClass *klass, const void *data)
+     DeviceClass *dc = DEVICE_CLASS(klass);
+ 
+     dc->desc = "VMApple Backdoor Interface";
++    dc->realize = bdif_realize;
+     device_class_set_props(dc, bdif_properties);
+ }
+ 
+diff --git a/hw/vmapple/meson.build b/hw/vmapple/meson.build
+index 23bc4c9..9121a8b 100644
+--- a/hw/vmapple/meson.build
++++ b/hw/vmapple/meson.build
+@@ -2,6 +2,7 @@
+ 
+ system_ss.add(when: 'CONFIG_VMAPPLE_AES',  if_true: files('aes.c'))
+ system_ss.add(when: 'CONFIG_VMAPPLE_BDIF', if_true: files('bdif.c'))
++system_ss.add(when: 'CONFIG_VMAPPLE_BDIF', if_true: files('vusb.c', 'vusb-pci.c'))
+ system_ss.add(when: 'CONFIG_VMAPPLE_CFG',  if_true: files('cfg.c'))
+ system_ss.add(when: 'CONFIG_VMAPPLE_VIRTIO_BLK',  if_true: files('virtio-blk.c'))
+ specific_ss.add(when: 'CONFIG_VMAPPLE',     if_true: files('vmapple.c'))
+diff --git a/hw/vmapple/trace-events b/hw/vmapple/trace-events
+index 93380ed..0624439 100644
+--- a/hw/vmapple/trace-events
++++ b/hw/vmapple/trace-events
+@@ -19,3 +19,17 @@ aes_dump_data(const char *desc, const char *hex) "%s%s"
+ bdif_read(uint64_t offset, uint32_t size, uint64_t value) "offset=0x%"PRIx64" size=0x%x value=0x%"PRIx64
+ bdif_write(uint64_t offset, uint32_t size, uint64_t value) "offset=0x%"PRIx64" size=0x%x value=0x%"PRIx64
+ bdif_vblk_read(const char *dev, uint64_t addr, uint64_t offset, uint32_t len, int r) "dev=%s addr=0x%"PRIx64" off=0x%"PRIx64" size=0x%x r=%d"
++bdif_vblk_write(const char *dev, uint64_t addr, uint64_t offset, uint32_t len, int r) "dev=%s addr=0x%"PRIx64" off=0x%"PRIx64" size=0x%x r=%d"
++
++# vusb.c
++vusb_read(uint64_t addr, unsigned size, uint64_t val) "0x%04" PRIx64 " size %u -> 0x%" PRIx64
++vusb_write(uint64_t addr, unsigned size, uint64_t val) "0x%04" PRIx64 " size %u <- 0x%" PRIx64
++vusb_tx(uint32_t len, uint8_t code, uint8_t ep) "to host: %u bytes, code %u ep 0x%02x"
++vusb_rx(uint32_t len, uint32_t plen, uint8_t ep, uint8_t type) "from host: %u bytes, payload %u ep 0x%02x type %u"
++
++# vusb-pci.c
++vusb_pci_status(uint8_t status, bool active) "status 0x%02x active=%d"
++vusb_pci_features(uint64_t features) "requested features 0x%016" PRIx64
++vusb_pci_iov(uint8_t queue, uint32_t out_num, uint32_t in_num, uint64_t out_len, uint64_t in_len) "queue %u iov out %u in %u out_len %" PRIu64 " in_len %" PRIu64
++vusb_pci_tx(uint32_t len, uint8_t code, uint8_t ep) "to host: %u bytes code %u ep 0x%02x"
++vusb_pci_rx(uint32_t len, uint8_t ep, uint8_t type, uint32_t a, uint32_t b) "from host: %u bytes ep 0x%02x type %u head %08x %08x"
+diff --git a/hw/vmapple/virtio-blk.c b/hw/vmapple/virtio-blk.c
+index 0a52972..e77909f 100644
+--- a/hw/vmapple/virtio-blk.c
++++ b/hw/vmapple/virtio-blk.c
+@@ -91,6 +91,7 @@ static void vmapple_virtio_blk_class_init(ObjectClass *klass, const void *data)
+     VMAppleVirtIOBlkClass *vvbk = VMAPPLE_VIRTIO_BLK_CLASS(klass);
+ 
+     vbk->handle_unknown_request = vmapple_virtio_blk_handle_unknown_request;
++    vbk->oversized_discard = true;
+     vvbk->get_config = vdc->get_config;
+     vdc->get_config = vmapple_virtio_blk_get_config;
+ }
+diff --git a/hw/vmapple/vmapple.c b/hw/vmapple/vmapple.c
+index 2e055b0..bfae529 100644
+--- a/hw/vmapple/vmapple.c
++++ b/hw/vmapple/vmapple.c
+@@ -66,10 +66,12 @@ struct VMAppleMachineState {
+     const int *irqmap;
+     DeviceState *gic;
+     DeviceState *cfg;
++    DeviceState *vusb;
+     DeviceState *pvpanic;
+     Notifier powerdown_notifier;
+     PCIBus *bus;
+     MemoryRegion fw_mr;
++    MemoryRegion scratch_mr;
+     MemoryRegion ecam_alias;
+     uint64_t uuid;
+     char *tablet;
+@@ -84,6 +86,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(VMAppleMachineState, VMAPPLE_MACHINE)
+ enum {
+     VMAPPLE_FIRMWARE,
+     VMAPPLE_CONFIG,
++    VMAPPLE_SCRATCH,
+     VMAPPLE_MEM,
+     VMAPPLE_GIC_DIST,
+     VMAPPLE_GIC_REDIST,
+@@ -106,6 +109,7 @@ enum {
+ static const MemMapEntry memmap[] = {
+     [VMAPPLE_FIRMWARE] =           { 0x00100000, 0x00100000 },
+     [VMAPPLE_CONFIG] =             { 0x00400000, 0x00010000 },
++    [VMAPPLE_SCRATCH] =            { 0x00410000, 0x002f0000 },
+ 
+     [VMAPPLE_GIC_DIST] =           { 0x10000000, 0x00010000 },
+     [VMAPPLE_GIC_REDIST] =         { 0x10010000, 0x00400000 },
+@@ -171,6 +175,11 @@ static void create_bdif(VMAppleMachineState *vms, MemoryRegion *mem)
+     qdev_prop_set_drive(DEVICE(bdif), "root", blk_by_legacy_dinfo(di_root));
+ 
+     sysbus_realize_and_unref(bdif_sb, &error_fatal);
++
++    /* The backdoor interface's USB slot, which the ROM's DFU mode and iBoot use. */
++    vms->vusb = DEVICE(sysbus_create_simple(TYPE_VMAPPLE_VUSB, -1, NULL));
++    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(vms->vusb), 0,
++                            vms->memmap[VMAPPLE_BDOOR].base + 0x100000, 1);
+ }
+ 
+ static void create_pvpanic(VMAppleMachineState *vms, MemoryRegion *mem)
+@@ -444,6 +453,12 @@ static void create_pcie(VMAppleMachineState *vms)
+     vms->bus = pci->bus;
+     g_assert(vms->bus);
+ 
++    /* The restore OS drives USB through PCI 106b:1a01, not the backdoor slot. */
++    dev = qdev_new(TYPE_VMAPPLE_VUSB_PCI);
++    object_property_set_link(OBJECT(dev), "vusb", OBJECT(vms->vusb),
++                             &error_fatal);
++    qdev_realize_and_unref(dev, BUS(vms->bus), &error_fatal);
++
+     while ((dev = qemu_create_nic_device("virtio-net-pci", true, NULL))) {
+         qdev_realize_and_unref(dev, BUS(vms->bus), &error_fatal);
+     }
+@@ -688,6 +703,11 @@ static void mach_vmapple_init(MachineState *machine)
+     create_pvpanic(vms, sysmem);
+     create_aes(vms, sysmem);
+     create_gfx(vms, sysmem);
++    /* OpenAVB's entropy slot; keep it out of the GPU's initial RAM map. */
++    memory_region_init_ram(&vms->scratch_mr, NULL, "avp-scratch",
++                           vms->memmap[VMAPPLE_SCRATCH].size, &error_fatal);
++    memory_region_add_subregion(sysmem, vms->memmap[VMAPPLE_SCRATCH].base,
++                                &vms->scratch_mr);
+     create_uart(vms, VMAPPLE_UART, sysmem, serial_hd(0));
+     create_rtc(vms);
+     create_pcie(vms);
+diff --git a/include/hw/pci/pci_ids.h b/include/hw/pci/pci_ids.h
+index 477609e..09099e6 100644
+--- a/include/hw/pci/pci_ids.h
++++ b/include/hw/pci/pci_ids.h
+@@ -197,6 +197,7 @@
+ #define PCI_DEVICE_ID_APPLE_U3_AGP       0x004b
+ #define PCI_DEVICE_ID_APPLE_UNI_N_GMAC   0x0021
+ #define PCI_DEVICE_ID_APPLE_VIRTIO_BLK   0x1a00
++#define PCI_DEVICE_ID_APPLE_VIRTIO_USB   0x1a01
+ 
+ #define PCI_VENDOR_ID_SUN                0x108e
+ #define PCI_DEVICE_ID_SUN_EBUS           0x1000
+diff --git a/include/hw/virtio/virtio-blk.h b/include/hw/virtio/virtio-blk.h
+index 3d8dee7..0a75708 100644
+--- a/include/hw/virtio/virtio-blk.h
++++ b/include/hw/virtio/virtio-blk.h
+@@ -106,6 +106,8 @@ typedef struct VirtIOBlkClass {
+     /*< public >*/
+     bool (*handle_unknown_request)(VirtIOBlockReq *req, MultiReqBuffer *mrb,
+                                    uint32_t type);
++    /* The guest discards a whole disk in one request and ignores the limit. */
++    bool oversized_discard;
+ } VirtIOBlkClass;
+ 
+ void virtio_blk_handle_vq(VirtIOBlock *s, VirtQueue *vq);
+diff --git a/include/hw/virtio/virtio-pci.h b/include/hw/virtio/virtio-pci.h
+index ee50fb0..6c68305 100644
+--- a/include/hw/virtio/virtio-pci.h
++++ b/include/hw/virtio/virtio-pci.h
+@@ -39,6 +39,7 @@ enum {
+     VIRTIO_PCI_FLAG_AER_BIT,
+     VIRTIO_PCI_FLAG_ATS_PAGE_ALIGNED_BIT,
+     VIRTIO_PCI_FLAG_PM_NO_SOFT_RESET_BIT,
++    VIRTIO_PCI_FLAG_ALLOW_QUEUE_DISABLE_BIT,
+ };
+ 
+ /* Need to activate work-arounds for buggy guests at vmstate load. */
+@@ -71,6 +72,9 @@ enum {
+ #define VIRTIO_PCI_FLAG_AER (1 << VIRTIO_PCI_FLAG_AER_BIT)
+ 
+ /* Page Aligned Address space Translation Service */
++#define VIRTIO_PCI_FLAG_ALLOW_QUEUE_DISABLE \
++  (1 << VIRTIO_PCI_FLAG_ALLOW_QUEUE_DISABLE_BIT)
++
+ #define VIRTIO_PCI_FLAG_ATS_PAGE_ALIGNED \
+   (1 << VIRTIO_PCI_FLAG_ATS_PAGE_ALIGNED_BIT)
+ 
+diff --git a/include/hw/vmapple/vmapple.h b/include/hw/vmapple/vmapple.h
+index 9c1ad1b..df38e8f 100644
+--- a/include/hw/vmapple/vmapple.h
++++ b/include/hw/vmapple/vmapple.h
+@@ -12,6 +12,8 @@
+ #ifndef HW_VMAPPLE_VMAPPLE_H
+ #define HW_VMAPPLE_VMAPPLE_H
+ 
++#include "qemu/typedefs.h"
++
+ #define TYPE_APPLE_AES "apple-aes"
+ 
+ #define TYPE_VMAPPLE_BDIF "vmapple-bdif"
+@@ -20,4 +22,19 @@
+ 
+ #define TYPE_VMAPPLE_VIRTIO_BLK_PCI "vmapple-virtio-blk-pci"
+ 
++#define TYPE_VMAPPLE_VUSB "vresearch-vusb"
++#define TYPE_VMAPPLE_VUSB_PCI "vresearch-vusb-pci"
++
++/* Shared device-mode USB link for the ROM, iBoot and RestoreOS. */
++typedef struct VUSBAltTransport {
++    void (*kick)(void *opaque);
++    void *opaque;
++} VUSBAltTransport;
++
++void vusb_set_alt_transport(DeviceState *vusb, const VUSBAltTransport *alt);
++void vusb_alt_activate(DeviceState *vusb, bool active);
++GByteArray *vusb_pop_host_msg(DeviceState *vusb);
++void vusb_unpop_host_msg(DeviceState *vusb, GByteArray *msg);
++void vusb_msg_to_host(DeviceState *vusb, const uint8_t *msg, uint32_t len);
++
+ #endif /* HW_VMAPPLE_VMAPPLE_H */
+diff --git a/hw/vmapple/vusb.c b/hw/vmapple/vusb.c
+new file mode 100644
+index 0000000..43ea245
+--- /dev/null
++++ b/hw/vmapple/vusb.c
+@@ -0,0 +1,534 @@
++/*
++ * vresearch101 virtual USB device controller (AVP device 0x1a01)
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * AVPBooter's DFU mode and iBoot's recovery mode present the device side of
++ * "Apple Mobile Device" through this controller, which sits in the backdoor
++ * interface's USB slot (0x30100000) and uses the same paravirtual transport
++ * as the bdif block devices:
++ *
++ *   0x000  status (1: present)
++ *   0x004  device id (0x1a01)
++ *   0x008  offset of the queue registers (64-bit)
++ *   0x010  completion of the selected queue's request (bit 0)
++ *   0x400  reset handshake (written 1, read back 1)
++ *   0x404  driver status
++ *   0x408  guest address of a request for the selected queue (64-bit)
++ *   0x410  queue select
++ *
++ * A request is a chain of up to VUSB_CHAIN_MAX descriptors
++ * { u64 addr; u32 len; u16 count (1); u16 flags }, flags bit 0 meaning
++ * another descriptor follows and bit 1 that the device writes the buffer.
++ * Queue 0 receives messages from the USB host, queue 1 sends messages to
++ * it. The driver polls 0x10: a TX request completes at once, an RX request
++ * when the host has a message for it. Posting a request clears the queue's
++ * completion; the TX queue starts out complete (iBoot waits for an idle TX
++ * queue before each send and panics after 5 s). On completion the device
++ * also writes the request's first descriptor back: flags = 0x8000 and, for
++ * a receive, len = the bytes written. OpenAVB polls that word in RAM instead
++ * of 0x10 (Virtualization.framework does both); AVPBooter and iBoot ignore it.
++ *
++ * Host to device message: { u32 len; u8 ep; u8 type; u8 payload[len] }
++ *   type 1: data for an endpoint; on EP0 OUT (ep 0x00) the payload starts
++ *           with the 8-byte SETUP packet, followed by any OUT data stage;
++ *           on an IN endpoint it asks for the next IN transfer
++ *   type 2: bus reset (iBoot's USB core event 2)
++ *   type 3: endpoint abort
++ * Device to host message: { u8 code; u8 ep (EP0 IN as 0); u8 data[] }
++ *   code 1: data on an IN endpoint / OUT transfer complete
++ *   code 2: stall (?)
++ *   code 4: bus reset done
++ *   code 5: abort done
++ *   code 6: driver reset: the guest (re)initialised the controller, as each
++ *           boot stage does (AVPBooter's DFU, iBoot, the restore OS). The
++ *           USB device it presented is gone; the host should treat this as
++ *           an unplug and enumerate the new device. Sent with ep 0, no data.
++ *
++ * Inferred from AVPBooter's and iBoot's drivers. With a chardev attached,
++ * the host side is a byte stream: host to device messages are sent as they
++ * are (they carry their length), device to host messages are prefixed with
++ * a u32 little-endian length. The test-enum property makes the device send
++ * itself a bus reset and GET_DESCRIPTOR(device) once the driver posts its
++ * first receive buffer (iBoot's recovery mode answers with the 05ac:1281
++ * device descriptor).
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qemu/bswap.h"
++#include "hw/core/irq.h"
++#include "hw/core/sysbus.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/core/qdev-properties-system.h"
++#include "chardev/char-fe.h"
++#include "hw/vmapple/vmapple.h"
++#include "system/dma.h"
++#include "trace.h"
++
++#define TYPE_VUSB TYPE_VMAPPLE_VUSB
++OBJECT_DECLARE_SIMPLE_TYPE(VUSBState, VUSB)
++
++#define VUSB_MMIO_SIZE      0x10000
++#define VUSB_DEVICE_ID      0x1a01
++#define VUSB_QUEUE_REGS     0x420
++#define VUSB_QUEUES         2
++#define VUSB_RX             0
++#define VUSB_TX             1
++#define VUSB_CHAIN_MAX      8
++#define VUSB_MSG_HDR        6
++#define VUSB_MSG_MAX        0x10000
++#define VUSB_HOST_FIFO      64
++#define VUSB_CODE_DRIVER_RESET 6
++
++#define REG_STATUS          0x000
++#define REG_DEVICE_ID       0x004
++#define REG_QUEUE_REGS      0x008
++#define REG_COMPLETION      0x010
++#define REG_RESET           0x400
++#define REG_DRIVER_STATUS   0x404
++#define REG_REQUEST         0x408
++#define REG_QUEUE_SEL       0x410
++
++#define DESC_F_NEXT         (1 << 0)
++#define DESC_F_WRITE        (1 << 1)
++/* written into a request's first descriptor when the device is done with it */
++#define DESC_F_COMPLETE     0x8000
++
++typedef struct VUSBDesc {
++    uint64_t addr;
++    uint32_t len;
++    uint16_t flags;
++} VUSBDesc;
++
++typedef struct VUSBQueue {
++    uint64_t request;       /* guest address of the pending chain, 0: none */
++    bool done;
++} VUSBQueue;
++
++struct VUSBState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    qemu_irq irq;
++    CharFrontend chr;
++    bool test_enum;
++    bool test_sent;
++
++    uint32_t reset;
++    uint32_t driver_status;
++    uint32_t queue_sel;
++    VUSBQueue queues[VUSB_QUEUES];
++
++    /* messages from the host waiting for a receive buffer */
++    GQueue host_msgs;
++    /* the VirtIO-PCI transport, and whether its driver owns the link */
++    VUSBAltTransport alt;
++    bool alt_active;
++    /* partial message from the chardev */
++    GByteArray *rx_buf;
++};
++
++static int vusb_read_chain(VUSBState *s, uint64_t addr, VUSBDesc *descs)
++{
++    int n = 0;
++    uint8_t raw[16];
++
++    do {
++        if (n == VUSB_CHAIN_MAX ||
++            dma_memory_read(&address_space_memory, addr + n * 16, raw,
++                            sizeof(raw), MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
++            qemu_log_mask(LOG_GUEST_ERROR,
++                          "vusb: bad request chain at 0x%" PRIx64 "\n", addr);
++            return -1;
++        }
++        descs[n].addr = ldq_le_p(&raw[0]);
++        descs[n].len = ldl_le_p(&raw[8]);
++        descs[n].flags = lduw_le_p(&raw[14]);
++    } while (descs[n++].flags & DESC_F_NEXT);
++
++    return n;
++}
++
++static void vusb_send_to_host(VUSBState *s, const uint8_t *msg, uint32_t len)
++{
++    uint8_t hdr[4];
++
++    trace_vusb_tx(len, len > 0 ? msg[0] : 0, len > 1 ? msg[1] : 0);
++    if (!qemu_chr_fe_backend_connected(&s->chr)) {
++        return;
++    }
++    stl_le_p(hdr, len);
++    qemu_chr_fe_write_all(&s->chr, hdr, sizeof(hdr));
++    qemu_chr_fe_write_all(&s->chr, msg, len);
++}
++
++/*
++ * The guest's driver took the controller over afresh: whatever the previous
++ * stage presented is unplugged. Host messages queued for it are dropped (the
++ * new driver must not see them) and the host is told to enumerate again.
++ */
++static void vusb_driver_reset(VUSBState *s)
++{
++    static const uint8_t detach[2] = { VUSB_CODE_DRIVER_RESET, 0 };
++    GByteArray *msg;
++
++    while ((msg = g_queue_pop_head(&s->host_msgs))) {
++        g_byte_array_unref(msg);
++    }
++    vusb_send_to_host(s, detach, sizeof(detach));
++}
++
++/* mark a request done in its first descriptor (len only when used >= 0) */
++static void vusb_write_back(uint64_t request, int64_t used)
++{
++    uint8_t len[4];
++    uint8_t flags[2];
++
++    if (used >= 0) {
++        stl_le_p(len, used);
++        dma_memory_write(&address_space_memory, request + 8, len, sizeof(len),
++                         MEMTXATTRS_UNSPECIFIED);
++    }
++    stw_le_p(flags, DESC_F_COMPLETE);
++    dma_memory_write(&address_space_memory, request + 14, flags,
++                     sizeof(flags), MEMTXATTRS_UNSPECIFIED);
++}
++
++/* gather a transmit request and pass it to the host */
++static void vusb_do_tx(VUSBState *s, VUSBQueue *q)
++{
++    VUSBDesc descs[VUSB_CHAIN_MAX];
++    g_autoptr(GByteArray) msg = g_byte_array_new();
++    int n = vusb_read_chain(s, q->request, descs);
++
++    for (int i = 0; i < n; i++) {
++        uint32_t off = msg->len;
++
++        if (descs[i].flags & DESC_F_WRITE ||
++            off + descs[i].len > VUSB_MSG_MAX) {
++            qemu_log_mask(LOG_GUEST_ERROR, "vusb: bad transmit descriptor\n");
++            break;
++        }
++        g_byte_array_set_size(msg, off + descs[i].len);
++        dma_memory_read(&address_space_memory, descs[i].addr,
++                        msg->data + off, descs[i].len,
++                        MEMTXATTRS_UNSPECIFIED);
++    }
++    /* OpenAVB answers a malformed event with an empty send: nothing to pass on */
++    if (n > 0 && msg->len > 0) {
++        vusb_send_to_host(s, msg->data, msg->len);
++    }
++    if (n > 0) {
++        vusb_write_back(q->request, -1);
++    }
++    q->request = 0;
++    q->done = true;
++}
++
++/* hand the oldest host message to a waiting receive request */
++static void vusb_do_rx(VUSBState *s)
++{
++    VUSBQueue *q = &s->queues[VUSB_RX];
++    VUSBDesc descs[VUSB_CHAIN_MAX];
++    g_autoptr(GByteArray) msg = NULL;
++    uint32_t off = 0;
++    int n;
++
++    if (!q->request || g_queue_is_empty(&s->host_msgs)) {
++        return;
++    }
++    msg = g_queue_pop_head(&s->host_msgs);
++    n = vusb_read_chain(s, q->request, descs);
++    for (int i = 0; i < n && off < msg->len; i++) {
++        uint32_t len = MIN(descs[i].len, msg->len - off);
++
++        if (!(descs[i].flags & DESC_F_WRITE)) {
++            qemu_log_mask(LOG_GUEST_ERROR, "vusb: bad receive descriptor\n");
++            break;
++        }
++        dma_memory_write(&address_space_memory, descs[i].addr,
++                         msg->data + off, len, MEMTXATTRS_UNSPECIFIED);
++        off += len;
++    }
++    if (off < msg->len) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "vusb: %u-byte message truncated to %u\n",
++                      msg->len, off);
++    }
++    trace_vusb_rx(msg->len, ldl_le_p(msg->data), msg->data[4], msg->data[5]);
++    if (n > 0) {
++        vusb_write_back(q->request, off);
++    }
++    q->request = 0;
++    q->done = true;
++}
++
++static void vusb_queue_host_msg(VUSBState *s, GByteArray *msg)
++{
++    if (g_queue_get_length(&s->host_msgs) >= VUSB_HOST_FIFO) {
++        qemu_log_mask(LOG_GUEST_ERROR, "vusb: host message dropped\n");
++        g_byte_array_unref(msg);
++        return;
++    }
++    g_queue_push_tail(&s->host_msgs, msg);
++    if (s->alt_active) {
++        if (s->alt.kick) {
++            s->alt.kick(s->alt.opaque);
++        }
++    } else {
++        vusb_do_rx(s);
++    }
++}
++
++static void vusb_queue_test_msg(VUSBState *s, uint8_t ep, uint8_t type,
++                                const uint8_t *payload, uint32_t len)
++{
++    GByteArray *msg = g_byte_array_sized_new(VUSB_MSG_HDR + len);
++    uint8_t hdr[VUSB_MSG_HDR] = { 0, 0, 0, 0, ep, type };
++
++    stl_le_p(hdr, len);
++    g_byte_array_append(msg, hdr, sizeof(hdr));
++    g_byte_array_append(msg, payload, len);
++    vusb_queue_host_msg(s, msg);
++}
++
++static void vusb_test_enum(VUSBState *s)
++{
++    /* GET_DESCRIPTOR(DEVICE), 18 bytes */
++    static const uint8_t setup[] = { 0x80, 0x06, 0x00, 0x01,
++                                     0x00, 0x00, 0x12, 0x00 };
++
++    vusb_queue_test_msg(s, 0x00, 2, NULL, 0);
++    vusb_queue_test_msg(s, 0x00, 1, setup, sizeof(setup));
++}
++
++static uint64_t vusb_read(void *opaque, hwaddr addr, unsigned size)
++{
++    VUSBState *s = opaque;
++    uint64_t val = 0;
++
++    switch (addr) {
++    case REG_STATUS:
++        val = 1;
++        break;
++    case REG_DEVICE_ID:
++        val = VUSB_DEVICE_ID;
++        break;
++    case REG_QUEUE_REGS:
++        val = VUSB_QUEUE_REGS;
++        break;
++    case REG_COMPLETION:
++        val = s->queue_sel < VUSB_QUEUES && s->queues[s->queue_sel].done;
++        break;
++    case REG_RESET:
++        val = s->reset;
++        break;
++    case REG_DRIVER_STATUS:
++        val = s->driver_status;
++        break;
++    case REG_QUEUE_SEL:
++        val = s->queue_sel;
++        break;
++    default:
++        qemu_log_mask(LOG_UNIMP, "vusb: read 0x%" HWADDR_PRIx "\n", addr);
++        break;
++    }
++    if (addr != REG_COMPLETION) {
++        trace_vusb_read(addr, size, val);
++    }
++    return val;
++}
++
++static void vusb_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
++{
++    VUSBState *s = opaque;
++    VUSBQueue *q;
++
++    trace_vusb_write(addr, size, val);
++
++    switch (addr) {
++    case REG_RESET:
++        s->reset = val;
++        if (val) {
++            /* the backdoor slot's driver (AVPBooter, iBoot) owns the link */
++            s->alt_active = false;
++            vusb_driver_reset(s);
++        }
++        break;
++    case REG_DRIVER_STATUS:
++        s->driver_status = val;
++        break;
++    case REG_QUEUE_SEL:
++        s->queue_sel = val;
++        break;
++    case REG_REQUEST:
++        if (s->queue_sel >= VUSB_QUEUES) {
++            qemu_log_mask(LOG_GUEST_ERROR, "vusb: request on queue %u\n",
++                          s->queue_sel);
++            break;
++        }
++        q = &s->queues[s->queue_sel];
++        q->request = val;
++        q->done = false;
++        if (s->queue_sel == VUSB_TX) {
++            vusb_do_tx(s, q);
++            break;
++        }
++        if (s->test_enum && !s->test_sent) {
++            s->test_sent = true;
++            vusb_test_enum(s);
++        }
++        vusb_do_rx(s);
++        break;
++    case VUSB_QUEUE_REGS:
++        /* written 1 once during the probe */
++        break;
++    default:
++        qemu_log_mask(LOG_UNIMP, "vusb: write 0x%" HWADDR_PRIx
++                      " <- 0x%" PRIx64 "\n", addr, val);
++        break;
++    }
++}
++
++static const MemoryRegionOps vusb_ops = {
++    .read = vusb_read,
++    .write = vusb_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 8,
++    .impl.min_access_size = 4,
++    .impl.max_access_size = 8,
++};
++
++static int vusb_chr_can_receive(void *opaque)
++{
++    return VUSB_MSG_MAX;
++}
++
++static void vusb_chr_receive(void *opaque, const uint8_t *buf, int size)
++{
++    VUSBState *s = opaque;
++
++    g_byte_array_append(s->rx_buf, buf, size);
++    while (s->rx_buf->len >= VUSB_MSG_HDR) {
++        uint32_t total = VUSB_MSG_HDR + ldl_le_p(s->rx_buf->data);
++        GByteArray *msg;
++
++        if (total > VUSB_MSG_MAX) {
++            qemu_log_mask(LOG_GUEST_ERROR,
++                          "vusb: bad host message length, resyncing\n");
++            g_byte_array_set_size(s->rx_buf, 0);
++            return;
++        }
++        if (s->rx_buf->len < total) {
++            return;
++        }
++        msg = g_byte_array_sized_new(total);
++        g_byte_array_append(msg, s->rx_buf->data, total);
++        g_byte_array_remove_range(s->rx_buf, 0, total);
++        vusb_queue_host_msg(s, msg);
++    }
++}
++
++void vusb_set_alt_transport(DeviceState *dev, const VUSBAltTransport *alt)
++{
++    VUSB(dev)->alt = *alt;
++}
++
++void vusb_alt_activate(DeviceState *dev, bool active)
++{
++    VUSBState *s = VUSB(dev);
++
++    if (active == s->alt_active) {
++        return;
++    }
++    s->alt_active = active;
++    if (active) {
++        /* a new driver, a new device: unplug whatever the last stage showed */
++        vusb_driver_reset(s);
++    }
++}
++
++GByteArray *vusb_pop_host_msg(DeviceState *dev)
++{
++    return g_queue_pop_head(&VUSB(dev)->host_msgs);
++}
++
++void vusb_unpop_host_msg(DeviceState *dev, GByteArray *msg)
++{
++    g_queue_push_head(&VUSB(dev)->host_msgs, msg);
++}
++
++void vusb_msg_to_host(DeviceState *dev, const uint8_t *msg, uint32_t len)
++{
++    vusb_send_to_host(VUSB(dev), msg, len);
++}
++
++static void vusb_reset(DeviceState *dev)
++{
++    VUSBState *s = VUSB(dev);
++    GByteArray *msg;
++
++    s->alt_active = false;
++    s->reset = 0;
++    s->driver_status = 0;
++    s->queue_sel = 0;
++    s->test_sent = false;
++    memset(s->queues, 0, sizeof(s->queues));
++    s->queues[VUSB_TX].done = true;
++    while ((msg = g_queue_pop_head(&s->host_msgs))) {
++        g_byte_array_unref(msg);
++    }
++}
++
++static void vusb_realize(DeviceState *dev, Error **errp)
++{
++    VUSBState *s = VUSB(dev);
++
++    qemu_chr_fe_set_handlers(&s->chr, vusb_chr_can_receive, vusb_chr_receive,
++                             NULL, NULL, s, NULL, true);
++}
++
++static void vusb_init(Object *obj)
++{
++    VUSBState *s = VUSB(obj);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++
++    memory_region_init_io(&s->iomem, obj, &vusb_ops, s, "vresearch-vusb",
++                          VUSB_MMIO_SIZE);
++    sysbus_init_mmio(sbd, &s->iomem);
++    sysbus_init_irq(sbd, &s->irq);
++    g_queue_init(&s->host_msgs);
++    s->rx_buf = g_byte_array_new();
++}
++
++static const Property vusb_properties[] = {
++    DEFINE_PROP_CHR("chardev", VUSBState, chr),
++    DEFINE_PROP_BOOL("test-enum", VUSBState, test_enum, false),
++};
++
++static void vusb_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    device_class_set_legacy_reset(dc, vusb_reset);
++    device_class_set_props(dc, vusb_properties);
++    dc->realize = vusb_realize;
++    dc->desc = "vresearch101 virtual USB device controller";
++}
++
++static const TypeInfo vusb_info = {
++    .name          = TYPE_VMAPPLE_VUSB,
++    .parent        = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(VUSBState),
++    .instance_init = vusb_init,
++    .class_init    = vusb_class_init,
++};
++
++static void vusb_register_types(void)
++{
++    type_register_static(&vusb_info);
++}
++
++type_init(vusb_register_types)
+diff --git a/hw/vmapple/vusb-pci.c b/hw/vmapple/vusb-pci.c
+new file mode 100644
+index 0000000..5b852e4
+--- /dev/null
++++ b/hw/vmapple/vusb-pci.c
+@@ -0,0 +1,371 @@
++/*
++ * Apple VirtIO USB device-mode controller for vresearch101.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * AVPBooter and iBoot use the backdoor MMIO transport implemented in vusb.c.
++ * RestoreOS binds to PCI 106b:1a01 and uses the same USB message stream over
++ * VirtIO queues. Queue 0 carries host-to-guest requests and queue 1 carries
++ * guest-to-host responses. It reuses vusb.c's message
++ * framing so the USB/IP bridge and MMIO transport share one device-side USB
++ * link. The Apple queue ABI is inferred and needs validation against a live
++ * RestoreOS guest.
++ */
++
++#include "qemu/osdep.h"
++#include "hw/vmapple/vmapple.h"
++#include "hw/virtio/virtio.h"
++#include "hw/virtio/virtio-pci.h"
++#include "hw/pci/pci.h"
++#include "hw/pci/pci_ids.h"
++#include "hw/core/qdev-properties.h"
++#include "qemu/iov.h"
++#include "qemu/log.h"
++#include "qapi/error.h"
++#include "trace.h"
++
++#define TYPE_VMAPPLE_VUSB_DEVICE "vresearch-vusb-device"
++OBJECT_DECLARE_SIMPLE_TYPE(VUSBVirtIODevice, VMAPPLE_VUSB_DEVICE)
++
++OBJECT_DECLARE_SIMPLE_TYPE(VUSBPCIDevice, VMAPPLE_VUSB_PCI)
++
++#define VUSB_VIRTIO_DEVICE_ID 0x1a01
++#define VUSB_QUEUE_SIZE       128
++#define VUSB_QUEUE_COUNT      2
++#define VUSB_MSG_MAX          0x10000
++#define VUSB_QUEUE_TO_GUEST   0
++#define VUSB_QUEUE_TO_HOST    1
++
++struct VUSBVirtIODevice {
++    VirtIODevice parent_obj;
++
++    DeviceState *vusb;
++    VirtQueue *to_host;
++    VirtQueue *to_guest;
++    bool active;
++};
++
++struct VUSBPCIDevice {
++    VirtIOPCIProxy parent_obj;
++
++    VUSBVirtIODevice vdev;
++    DeviceState *vusb;
++};
++
++static size_t vusb_pci_iov_size(const struct iovec *iov, unsigned int count)
++{
++    size_t size = 0;
++    unsigned int i;
++
++    for (i = 0; i < count; i++) {
++        if (iov[i].iov_len > VUSB_MSG_MAX - size) {
++            return VUSB_MSG_MAX + 1;
++        }
++        size += iov[i].iov_len;
++    }
++    return size;
++}
++
++/* The guest is returning a USB transfer result to the host-side bridge. */
++static void vusb_pci_handle_to_host(VirtIODevice *vdev, VirtQueue *vq)
++{
++    VUSBVirtIODevice *s = VMAPPLE_VUSB_DEVICE(vdev);
++    VirtQueueElement *elem;
++
++    if (!s->active) {
++        return;
++    }
++
++    while ((elem = virtqueue_pop(vq, sizeof(*elem)))) {
++        size_t len = vusb_pci_iov_size(elem->out_sg, elem->out_num);
++
++        trace_vusb_pci_iov(VUSB_QUEUE_TO_HOST, elem->out_num, elem->in_num,
++                           len, vusb_pci_iov_size(elem->in_sg, elem->in_num));
++        if (!len || len > VUSB_MSG_MAX || !elem->out_num) {
++            qemu_log_mask(LOG_GUEST_ERROR,
++                          "vusb-pci: invalid guest response descriptor\n");
++        } else {
++            g_autofree uint8_t *msg = g_malloc(len);
++            size_t copied = iov_to_buf(elem->out_sg, elem->out_num, 0,
++                                       msg, len);
++
++            if (copied != len) {
++                qemu_log_mask(LOG_GUEST_ERROR,
++                              "vusb-pci: short guest response (%zu/%zu)\n",
++                              copied, len);
++            } else {
++                trace_vusb_pci_tx(len, msg[0], len > 1 ? msg[1] : 0);
++                vusb_msg_to_host(s->vusb, msg, len);
++            }
++        }
++
++        virtqueue_push(vq, elem, 0);
++        g_free(elem);
++    }
++    virtio_notify(vdev, vq);
++}
++
++/* Deliver queued host requests into the guest's writable response buffers. */
++static void vusb_pci_handle_to_guest(VUSBVirtIODevice *s)
++{
++    VirtIODevice *vdev = VIRTIO_DEVICE(s);
++    VirtQueue *vq = s->to_guest;
++    VirtQueueElement *elem;
++    bool notified = false;
++
++    if (!s->active) {
++        return;
++    }
++
++    while ((elem = virtqueue_pop(vq, sizeof(*elem)))) {
++        GByteArray *msg = vusb_pop_host_msg(s->vusb);
++        size_t capacity = vusb_pci_iov_size(elem->in_sg, elem->in_num);
++        size_t copied;
++
++        trace_vusb_pci_iov(VUSB_QUEUE_TO_GUEST, elem->out_num, elem->in_num,
++                           vusb_pci_iov_size(elem->out_sg, elem->out_num),
++                           capacity);
++        if (elem->out_num) {
++            qemu_log_mask(LOG_GUEST_ERROR,
++                          "vusb-pci: to-guest element also has %u readable descriptor(s)\n",
++                          elem->out_num);
++        }
++        if (!msg) {
++            virtqueue_unpop(vq, elem, 0);
++            g_free(elem);
++            break;
++        }
++        if (!elem->in_num || capacity < msg->len) {
++            qemu_log_mask(LOG_GUEST_ERROR,
++                          "vusb-pci: guest buffer too small (%zu for %u-byte message)\n",
++                          capacity, msg->len);
++            vusb_unpop_host_msg(s->vusb, msg);
++            virtqueue_unpop(vq, elem, 0);
++            g_free(elem);
++            break;
++        }
++
++        copied = iov_from_buf(elem->in_sg, elem->in_num, 0,
++                              msg->data, msg->len);
++        if (copied != msg->len) {
++            qemu_log_mask(LOG_GUEST_ERROR,
++                          "vusb-pci: short host message copy (%zu/%u)\n",
++                          copied, msg->len);
++            vusb_unpop_host_msg(s->vusb, msg);
++            virtqueue_unpop(vq, elem, 0);
++            g_free(elem);
++            break;
++        }
++
++        virtqueue_push(vq, elem, copied);
++        if (msg->len >= 6) {
++            uint32_t head0 = 0, head1 = 0;
++            for (unsigned int i = 0; i < 4 && i < msg->len; i++) {
++                head0 |= (uint32_t)msg->data[i] << (8 * i);
++            }
++            for (unsigned int i = 4; i < 8 && i < msg->len; i++) {
++                head1 |= (uint32_t)msg->data[i] << (8 * (i - 4));
++            }
++            trace_vusb_pci_rx(msg->len, msg->data[4], msg->data[5],
++                              head0, head1);
++        }
++        g_byte_array_unref(msg);
++        g_free(elem);
++        notified = true;
++    }
++
++    if (notified) {
++        virtio_notify(vdev, vq);
++    }
++}
++
++static void vusb_pci_handle_guest_buffers(VirtIODevice *vdev, VirtQueue *vq)
++{
++    (void)vq;
++    vusb_pci_handle_to_guest(VMAPPLE_VUSB_DEVICE(vdev));
++}
++
++static void vusb_pci_kick(void *opaque)
++{
++    vusb_pci_handle_to_guest(opaque);
++}
++
++static int vusb_pci_set_status(VirtIODevice *vdev, uint8_t status)
++{
++    VUSBVirtIODevice *s = VMAPPLE_VUSB_DEVICE(vdev);
++    bool active = virtio_device_should_start(vdev, status);
++
++    trace_vusb_pci_status(status, active);
++    if (active != s->active) {
++        s->active = active;
++        vusb_alt_activate(s->vusb, active);
++    }
++
++    if (active) {
++        vusb_pci_handle_to_host(vdev, s->to_host);
++        vusb_pci_handle_to_guest(s);
++    }
++    return 0;
++}
++
++static uint64_t vusb_pci_get_features(VirtIODevice *vdev,
++                                      uint64_t requested_features,
++                                      Error **errp)
++{
++    trace_vusb_pci_features(requested_features);
++    return requested_features;
++}
++
++static void vusb_pci_reset(VirtIODevice *vdev)
++{
++    VUSBVirtIODevice *s = VMAPPLE_VUSB_DEVICE(vdev);
++
++    if (s->active) {
++        s->active = false;
++        vusb_alt_activate(s->vusb, false);
++    }
++}
++
++static void vusb_device_realize(DeviceState *dev, Error **errp)
++{
++    VUSBVirtIODevice *s = VMAPPLE_VUSB_DEVICE(dev);
++    VirtIODevice *vdev = VIRTIO_DEVICE(dev);
++    VUSBAltTransport alt = {
++        .kick = vusb_pci_kick,
++        .opaque = s,
++    };
++
++    if (!s->vusb) {
++        error_setg(errp, "vusb-pci requires its MMIO vusb device");
++        return;
++    }
++
++    virtio_init(vdev, VUSB_VIRTIO_DEVICE_ID, 0);
++    vdev->name = "vresearch-vusb";
++    s->to_guest = virtio_add_queue(vdev, VUSB_QUEUE_SIZE,
++                                   vusb_pci_handle_guest_buffers);
++    s->to_host = virtio_add_queue(vdev, VUSB_QUEUE_SIZE,
++                                  vusb_pci_handle_to_host);
++    vusb_set_alt_transport(s->vusb, &alt);
++}
++
++static void vusb_device_unrealize(DeviceState *dev)
++{
++    VUSBVirtIODevice *s = VMAPPLE_VUSB_DEVICE(dev);
++    VUSBAltTransport alt = { 0 };
++
++    vusb_alt_activate(s->vusb, false);
++    vusb_set_alt_transport(s->vusb, &alt);
++    virtio_del_queue(VIRTIO_DEVICE(dev), VUSB_QUEUE_TO_HOST);
++    virtio_del_queue(VIRTIO_DEVICE(dev), VUSB_QUEUE_TO_GUEST);
++    virtio_cleanup(VIRTIO_DEVICE(dev));
++}
++
++static const VMStateDescription vmstate_vusb_device = {
++    .name = "vresearch-vusb-device",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_VIRTIO_DEVICE,
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void vusb_device_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    VirtioDeviceClass *vdc = VIRTIO_DEVICE_CLASS(klass);
++
++    dc->vmsd = &vmstate_vusb_device;
++    vdc->realize = vusb_device_realize;
++    vdc->unrealize = vusb_device_unrealize;
++    vdc->get_features = vusb_pci_get_features;
++    vdc->set_status = vusb_pci_set_status;
++    vdc->reset = vusb_pci_reset;
++}
++
++static const TypeInfo vusb_device_info = {
++    .name          = TYPE_VMAPPLE_VUSB_DEVICE,
++    .parent        = TYPE_VIRTIO_DEVICE,
++    .instance_size = sizeof(VUSBVirtIODevice),
++    .class_init    = vusb_device_class_init,
++};
++
++static const Property vusb_pci_properties[] = {
++    DEFINE_PROP_UINT32("class", VirtIOPCIProxy, class_code,
++                       PCI_CLASS_SERIAL_USB_DEVICE),
++    DEFINE_PROP_BIT("ioeventfd", VirtIOPCIProxy, flags,
++                    VIRTIO_PCI_FLAG_USE_IOEVENTFD_BIT, true),
++    DEFINE_PROP_BIT("x-allow-queue-disable", VirtIOPCIProxy, flags,
++                    VIRTIO_PCI_FLAG_ALLOW_QUEUE_DISABLE_BIT, true),
++    DEFINE_PROP_UINT32("vectors", VirtIOPCIProxy, nvectors,
++                       DEV_NVECTORS_UNSPECIFIED),
++    DEFINE_PROP_LINK("vusb", VUSBPCIDevice, vusb, TYPE_VMAPPLE_VUSB,
++                     DeviceState *),
++};
++
++static void vusb_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
++{
++    VUSBPCIDevice *dev = VMAPPLE_VUSB_PCI(vpci_dev);
++    PCIDevice *pci_dev = PCI_DEVICE(vpci_dev);
++
++    if (!dev->vusb) {
++        error_setg(errp, "vusb-pci requires a vusb link");
++        return;
++    }
++
++    if (vpci_dev->nvectors == DEV_NVECTORS_UNSPECIFIED) {
++        vpci_dev->nvectors = VUSB_QUEUE_COUNT + 1;
++    }
++
++    dev->vdev.vusb = dev->vusb;
++    if (!qdev_realize(DEVICE(&dev->vdev), BUS(&vpci_dev->bus), errp)) {
++        return;
++    }
++
++    pci_config_set_vendor_id(pci_dev->config, PCI_VENDOR_ID_APPLE);
++    pci_config_set_device_id(pci_dev->config, PCI_DEVICE_ID_APPLE_VIRTIO_USB);
++    /* Keep the legacy INTx line usable until the guest enables MSI-X. */
++    pci_dev->config[PCI_INTERRUPT_PIN] = 1;
++}
++
++static void vusb_pci_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    VirtioPCIClass *k = VIRTIO_PCI_CLASS(klass);
++    PCIDeviceClass *pcidev_k = PCI_DEVICE_CLASS(klass);
++
++    set_bit(DEVICE_CATEGORY_MISC, dc->categories);
++    device_class_set_props(dc, vusb_pci_properties);
++    k->realize = vusb_pci_realize;
++    pcidev_k->vendor_id = PCI_VENDOR_ID_APPLE;
++    pcidev_k->device_id = PCI_DEVICE_ID_APPLE_VIRTIO_USB;
++    pcidev_k->revision = VIRTIO_PCI_ABI_VERSION;
++    /* PCIDeviceClass stores only base class + subclass (the low byte of
++     * class_code carries the USB device-mode programming interface).
++     */
++    pcidev_k->class_id = PCI_CLASS_SERIAL_USB;
++}
++
++static void vusb_pci_instance_init(Object *obj)
++{
++    VUSBPCIDevice *dev = VMAPPLE_VUSB_PCI(obj);
++
++    virtio_instance_init_common(obj, &dev->vdev, sizeof(dev->vdev),
++                                TYPE_VMAPPLE_VUSB_DEVICE);
++}
++
++static const VirtioPCIDeviceTypeInfo vusb_pci_info = {
++    .generic_name  = TYPE_VMAPPLE_VUSB_PCI,
++    .instance_size = sizeof(VUSBPCIDevice),
++    .instance_init = vusb_pci_instance_init,
++    .class_init    = vusb_pci_class_init,
++};
++
++static void vusb_pci_register_types(void)
++{
++    type_register_static(&vusb_device_info);
++    virtio_pci_types_register(&vusb_pci_info);
++}
++
++type_init(vusb_pci_register_types)

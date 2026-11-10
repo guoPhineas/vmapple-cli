@@ -37,13 +37,13 @@ public struct VirtualMachine: Sendable {
         directory.appending(path: "vm.json")
     }
 
-    public static func create(at directory: URL, diskGiB: UInt64) throws -> VirtualMachine {
+    public static func create(at directory: URL, diskGiB: UInt64, inlineEncryption: Bool? = nil) throws -> VirtualMachine {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         var ecid: UInt64 = 0
         while ecid == 0 {
             ecid = UInt64.random(in: 1...(.max >> 1))
         }
-        let configuration = Configuration(ecid: ecid, diskBytes: diskGiB << 30, handoffAddresses: nil, installed: nil, image: nil, inlineEncryption: nil)
+        let configuration = Configuration(ecid: ecid, diskBytes: diskGiB << 30, handoffAddresses: nil, installed: nil, image: nil, inlineEncryption: inlineEncryption)
         let data = try JSONEncoder().encode(configuration)
         try data.write(to: configurationURL(directory))
         let machine = VirtualMachine(directory: directory, configuration: configuration)

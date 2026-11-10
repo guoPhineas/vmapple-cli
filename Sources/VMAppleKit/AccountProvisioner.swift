@@ -40,6 +40,9 @@ public final class AccountProvisioner {
     }
 
     public func run(user: String, fullName: String, password: String) throws {
+        guard options.accelerator == .kvm else {
+            throw QEMUError.refused("account provisioning needs single-user boot arguments, which the HVF QEMU profile does not support")
+        }
         guard user.range(of: "^[a-z_][a-z0-9_-]*$", options: .regularExpression) != nil else {
             throw ProvisionError.badName(user)
         }

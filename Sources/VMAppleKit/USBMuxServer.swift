@@ -4,6 +4,7 @@ import Foundation
 /// Unix socket, for libusbmuxd's `USBMUXD_SOCKET_ADDRESS`.
 public final class USBMuxServer: @unchecked Sendable {
     private let listener: UnixSocket
+    private let log: @Sendable (String) -> Void
     private let state = NSLock()
     private var mux: USBMuxLink?
     private var properties: [String: Any] = [:]
@@ -11,7 +12,8 @@ public final class USBMuxServer: @unchecked Sendable {
     private var closed = false
     private let deviceID = 1
 
-    public init(socketPath: String) throws {
+    public init(socketPath: String, log: @escaping @Sendable (String) -> Void = { _ in }) throws {
+        self.log = log
         listener = try UnixSocket.listen(path: socketPath)
         let thread = Thread { [self] in acceptLoop() }
         thread.name = "usbmuxd"
@@ -46,7 +48,7 @@ public final class USBMuxServer: @unchecked Sendable {
     /// Serves the device until the guest takes it away.
     public func serve(device: USBDevice) throws {
         let (endpoints, serial) = try prepare(device: device)
-        let link = USBMuxLink(device: device, endpoints: endpoints)
+        let link = USBMuxLink(device: device, endpoints: endpoints, log: log)
         try link.start()
         state.lock()
         mux = link

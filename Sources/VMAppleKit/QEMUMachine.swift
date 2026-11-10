@@ -1,11 +1,27 @@
 import Foundation
 
+public enum QEMUAccelerator: String, Sendable {
+    case kvm
+    case hvf
+
+    public static var host: Self {
+        #if os(macOS)
+        .hvf
+        #else
+        .kvm
+        #endif
+    }
+}
+
 public struct QEMUOptions: Sendable {
     public var executable: String
     public var rom: String
     public var cpus: Int
     public var memoryGiB: Int
     public var bootArguments: String
+    public var accelerator: QEMUAccelerator
+    public var showsWindow = false
+    public var usbDeviceMode: Bool
     public var handoffAddresses: [UInt64] = []
     /// iBoot reboots on its own, into recovery after a failed boot for one.
     /// A restore turns this off to see the restore OS finish.
@@ -16,12 +32,19 @@ public struct QEMUOptions: Sendable {
     /// leaves 24,000,000 counter ticks: 24 ms at this VM's 1 GHz timebase.
     public static let debugAckTimeoutBootArguments = "ml-timeout-debug-ack=1000000000000 ml-timeout-debug-ack-scale=1"
 
-    public init(executable: String, rom: String, cpus: Int, memoryGiB: Int, bootArguments: String) {
+    public static var defaultBootArguments: String {
+        QEMUAccelerator.host == .kvm ? "-v serial=11 debug=0x14c \(debugAckTimeoutBootArguments)" : ""
+    }
+
+    public init(executable: String, rom: String, cpus: Int, memoryGiB: Int, bootArguments: String,
+                accelerator: QEMUAccelerator = .host) {
         self.executable = executable
         self.rom = rom
         self.cpus = cpus
         self.memoryGiB = memoryGiB
         self.bootArguments = bootArguments
+        self.accelerator = accelerator
+        self.usbDeviceMode = accelerator == .kvm
     }
 }
 
@@ -39,7 +62,7 @@ public enum QEMUError: Error, CustomStringConvertible {
     }
 }
 
-/// One run of QEMU's `vmapple` machine under KVM.
+/// One run of QEMU's `vmapple` machine under KVM or HVF.
 public final class QEMUMachine: @unchecked Sendable {
     public let machine: VirtualMachine
     private let options: QEMUOptions
@@ -49,6 +72,8 @@ public final class QEMUMachine: @unchecked Sendable {
         self.machine = machine
         self.options = options
     }
+
+    var accelerator: QEMUAccelerator { options.accelerator }
 
     /// A vCPU must not move between core kinds, so the guest runs on the fastest.
     static func preferredCores() -> [Int] {
@@ -67,17 +92,23 @@ public final class QEMUMachine: @unchecked Sendable {
     /// Virtualization.framework's vendor configuration for a disk that does
     /// not encrypt inline: legacy features 3 (Patches/qemu 0017).
     private var rootDiskVendorData: String {
-        machine.configuration.inlineEncryption == false ? ",vendor-legacy-features=3" : ""
+        options.accelerator == .kvm && machine.configuration.inlineEncryption == false ? ",vendor-legacy-features=3" : ""
     }
 
     var arguments: [String] {
         let id = String(machine.configuration.ecid, radix: 16, uppercase: true)
         let memory = "\(options.memoryGiB)G"
         func path(_ url: URL) -> String { url.path }
-        return [
+        let platform = options.accelerator == .kvm ? [
             "-machine", "vmapple,accel=kvm,uuid=0x\(id),gfx-device=reims-vgpu-mmio,memory-backend=guestmem",
-            "-object", "memory-backend-file,id=guestmem,size=\(memory),share=on,align=16384,mem-path=\(path(machine.guestMemory))",
             "-cpu", "host,pmu=off,kvm-psci-version=1.1",
+        ] : [
+            "-machine", "vmapple,uuid=0x\(id),memory-backend=guestmem",
+            "-accel", "hvf,kernel-irqchip=on",
+            "-cpu", "host",
+        ]
+        return platform + [
+            "-object", "memory-backend-file,id=guestmem,size=\(memory),share=on,align=16384,mem-path=\(path(machine.guestMemory))",
             "-smp", String(options.cpus),
             "-m", memory,
             "-display", "none",
@@ -100,24 +131,35 @@ public final class QEMUMachine: @unchecked Sendable {
             "-device", "vmapple-virtio-blk-pci,variant=aux,drive=aux,share-rw=on",
             "-drive", "if=none,format=raw,file.filename=\(path(machine.disk)),file.locking=off,discard=unmap,id=root",
             "-device", "vmapple-virtio-blk-pci,variant=root,drive=root,share-rw=on" + rootDiskVendorData,
+            "-nic", "none",
+        ] + (options.usbDeviceMode ? [
             "-chardev", "socket,id=vusb,path=\(path(machine.usbSocket)),server=on,wait=off",
             "-global", "vresearch-vusb.chardev=vusb",
-            "-nic", "none",
-        ] + (options.allowsReboot ? [] : ["-no-reboot"])
+        ] : []) + (options.allowsReboot ? [] : ["-no-reboot"])
     }
 
-    public func start() throws {
-        for url in [machine.serialLog, machine.serialSocket, machine.qemuLog, machine.qmpSocket, machine.usbSocket, machine.guestMemory] {
-            try? FileManager.default.removeItem(at: url)
-        }
-        let cores = Self.preferredCores()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    var command: [String] {
+        let cores = options.accelerator == .kvm ? Self.preferredCores() : []
         // VMAPPLE_QEMU_ARGS adds arguments for debugging, such as -gdb.
         let extra = ProcessInfo.processInfo.environment["VMAPPLE_QEMU_ARGS"]?
             .split(separator: " ").map(String.init) ?? []
-        process.arguments = (cores.isEmpty ? [] : ["taskset", "-c", cores.map(String.init).joined(separator: ",")]) +
+        return (cores.isEmpty ? [] : ["taskset", "-c", cores.map(String.init).joined(separator: ",")]) +
             [options.executable] + arguments + extra
-        var environment = ProcessInfo.processInfo.environment
+    }
+
+    func environment(inheriting inherited: [String: String]) -> [String: String] {
+        var environment = inherited
+        environment["REIMS_VGPU_WINDOW"] = options.showsWindow ? "1" : "0"
+        environment["TMPDIR"] = machine.directory.path
+        environment["XDG_CACHE_HOME"] = machine.directory.appending(path: ".cache").path
+        // The HVF build uses its own kernel-entry hook and Reims's Metal backend.
+        // Do not pass Linux integration settings inherited from another VM run.
+        if options.accelerator == .hvf {
+            for key in Array(environment.keys) where key.hasPrefix("QEMU_VMAPPLE_") || key == "VK_DRIVER_FILES" {
+                environment.removeValue(forKey: key)
+            }
+            return environment
+        }
         environment["PATH"] = "/usr/lib/llvm-20/bin:" + (environment["PATH"] ?? "/usr/bin:/bin")
         environment["QEMU_VMAPPLE_HANDOFF"] = "1"
         environment["QEMU_VMAPPLE_PAC_DEFAULTS"] = "1"
@@ -127,7 +169,6 @@ public final class QEMUMachine: @unchecked Sendable {
         if !handoff.isEmpty {
             environment["QEMU_VMAPPLE_HANDOFF_PC"] = handoff.map { "0x" + String($0, radix: 16) }.joined(separator: ",")
         }
-        environment["REIMS_VGPU_WINDOW"] = "0"
         // Reims's zero-copy rails let the GPU write guest RAM it imported earlier.
         // On 27.2 the kernel had reused that RAM, and every boot panicked within a
         // minute of the language panel. Copying through a fresh page walk does not.
@@ -141,9 +182,50 @@ public final class QEMUMachine: @unchecked Sendable {
             environment[name] = "1"
         }
         environment["VK_DRIVER_FILES"] = "/usr/share/vulkan/icd.d/nvidia_icd.json"
-        environment["TMPDIR"] = machine.directory.path
-        environment["XDG_CACHE_HOME"] = machine.directory.appending(path: ".cache").path
-        process.environment = environment
+        return environment
+    }
+
+    /// Prints only launch settings, never the inherited environment or its secrets.
+    public var launchDescription: String {
+        func quote(_ value: String) -> String {
+            "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        }
+        let overrides = environment(inheriting: [:]).sorted { $0.key < $1.key }
+            .map { "\($0.key)=\(quote($0.value))" }
+        return "cd \(quote(machine.directory.path)) &&\n" +
+            (["env"] + overrides + command.map(quote)).joined(separator: " ")
+    }
+
+    public func validate() throws {
+        guard options.cpus > 0, options.memoryGiB > 0 else {
+            throw QEMUError.refused("CPU count and memory must be positive")
+        }
+        guard !options.rom.isEmpty, FileManager.default.fileExists(atPath: options.rom) else {
+            throw QEMUError.refused("boot ROM not found; set --rom or VMAPPLE_ROM")
+        }
+        if options.accelerator == .hvf {
+            guard options.bootArguments.isEmpty else {
+                throw QEMUError.refused("--boot-args is not supported by the HVF QEMU profile")
+            }
+            guard machine.configuration.inlineEncryption == false else {
+                throw QEMUError.refused("the HVF QEMU profile needs a disk marked inlineEncryption: false; use pull to import a Tart image")
+            }
+        }
+        if options.accelerator == .hvf || options.usbDeviceMode {
+            let check = HostChecks.qemu(executable: options.executable, accelerator: options.accelerator,
+                                        usbDeviceMode: options.usbDeviceMode)
+            guard check.state == .ok else { throw QEMUError.refused(check.detail) }
+        }
+    }
+
+    public func start() throws {
+        try validate()
+        for url in [machine.serialLog, machine.serialSocket, machine.qemuLog, machine.qmpSocket, machine.usbSocket, machine.guestMemory] {
+            try? FileManager.default.removeItem(at: url)
+        }
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = command
+        process.environment = environment(inheriting: ProcessInfo.processInfo.environment)
         process.currentDirectoryURL = machine.directory
         try process.run()
     }

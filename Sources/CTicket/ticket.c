@@ -1,6 +1,6 @@
 #include "ticket.h"
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 
 #include <libtatsu/tss.h>
 #include <plist/plist.h>

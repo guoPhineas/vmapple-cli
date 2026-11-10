@@ -26,6 +26,7 @@ final class USBMuxLink: @unchecked Sendable {
 
     private let device: USBDevice
     private let endpoints: USBMuxEndpoints
+    private let log: @Sendable (String) -> Void
     private let sendLock = NSLock()
     private let state = NSCondition()
     private var version: UInt32 = 0
@@ -36,10 +37,13 @@ final class USBMuxLink: @unchecked Sendable {
     private var buffer: [UInt8] = []
     private(set) var ended = false
 
-    init(device: USBDevice, endpoints: USBMuxEndpoints) {
+    init(device: USBDevice, endpoints: USBMuxEndpoints, log: @escaping @Sendable (String) -> Void) {
         self.device = device
         self.endpoints = endpoints
+        self.log = log
     }
+
+    func note(_ message: String) { log(message) }
 
     func start() throws {
         let thread = Thread { [self] in inputLoop() }
@@ -153,6 +157,7 @@ final class USBMuxLink: @unchecked Sendable {
                 }
             }
         } catch {
+            log("USB mux input ended: \(error)")
             state.lock()
             ended = true
             let remaining = Array(connections.values)
@@ -247,6 +252,7 @@ final class USBMuxConnection: @unchecked Sendable {
     private let mux: USBMuxLink
     private let client: UnixSocket
     private let state = NSCondition()
+    private let sendLock = NSLock()
     private var transmitSequence: UInt32 = 0
     private var transmitAcknowledgement: UInt32 = 0
     private var receivedAcknowledgement: UInt32 = 0
@@ -255,6 +261,8 @@ final class USBMuxConnection: @unchecked Sendable {
     private var refused = false
     private var ended = false
     private var outbox: [[UInt8]] = []
+    private var transmittedBytes: UInt64 = 0
+    private var receivedBytes: UInt64 = 0
     private static let transmitWindow: UInt32 = 131_072
 
     init(mux: USBMuxLink, local: UInt16, remote: UInt16, client: UnixSocket) {
@@ -265,9 +273,15 @@ final class USBMuxConnection: @unchecked Sendable {
     }
 
     func send(flags: UInt8, data: ArraySlice<UInt8> = []) throws {
+        // Data and ACKs originate on different threads. Reserve sequence
+        // space before USB I/O, and keep packet order equal to sequence order.
+        sendLock.lock()
+        defer { sendLock.unlock() }
         state.lock()
         let sequence = transmitSequence
         let acknowledgement = transmitAcknowledgement
+        transmitSequence &+= UInt32(data.count)
+        transmittedBytes &+= UInt64(data.count)
         state.unlock()
         try mux.sendTCP(
             local: local,
@@ -308,13 +322,20 @@ final class USBMuxConnection: @unchecked Sendable {
             ended = true
         } else if !data.isEmpty {
             transmitAcknowledgement &+= UInt32(data.count)
+            receivedBytes &+= UInt64(data.count)
             outbox.append(data)
         }
         let finished = ended
-        let shouldAcknowledge = !refused && !finished && (!wasEstablished || !data.isEmpty)
+        // Apple's mux expects an ACK even for a window-only update, as in
+        // usbmuxd's device_tcp_input; it is not a general TCP stack.
+        let shouldAcknowledge = !refused && !finished
         state.broadcast()
         state.unlock()
-        if finished { mux.remove(self) }
+        if finished {
+            let reason = String(decoding: data.prefix(512), as: UTF8.self)
+            mux.note("USB mux \(local):\(remote) guest closed: flags=\(flags) ack=\(acknowledgement) window=\(window) reason=\(reason)")
+            mux.remove(self)
+        }
         if shouldAcknowledge { try send(flags: Flag.ack) }
     }
 
@@ -333,9 +354,11 @@ final class USBMuxConnection: @unchecked Sendable {
         defer {
             state.lock()
             let alreadyEnded = ended
+            let summary = "USB mux \(local):\(remote) ended: tx=\(transmittedBytes) rx=\(receivedBytes) seq=\(transmitSequence) ack=\(receivedAcknowledgement) window=\(receiveWindow)"
             ended = true
             state.broadcast()
             state.unlock()
+            mux.note(summary)
             if !alreadyEnded {
                 try? send(flags: USBMuxLink.TCPFlag.reset)
                 mux.remove(self)
@@ -351,13 +374,12 @@ final class USBMuxConnection: @unchecked Sendable {
                     let room = try waitForWindow()
                     let end = min(offset + room, bytes.count)
                     try send(flags: USBMuxLink.TCPFlag.ack, data: bytes[offset..<end])
-                    state.lock()
-                    transmitSequence &+= UInt32(end - offset)
-                    state.unlock()
                     offset = end
                 }
             }
-        } catch {}
+        } catch {
+            mux.note("USB mux \(local):\(remote) send ended: \(error)")
+        }
     }
 
     private func waitForWindow() throws -> Int {
@@ -367,7 +389,12 @@ final class USBMuxConnection: @unchecked Sendable {
             if ended { throw SocketError.closed }
             let inFlight = transmitSequence &- receivedAcknowledgement
             if inFlight < receiveWindow { return Int(receiveWindow - inFlight) }
-            state.wait()
+            if !state.wait(until: Date(timeIntervalSinceNow: 5)) {
+                let summary = "USB mux \(local):\(remote) waiting: seq=\(transmitSequence) ack=\(receivedAcknowledgement) window=\(receiveWindow) inFlight=\(inFlight)"
+                state.unlock()
+                mux.note(summary)
+                state.lock()
+            }
         }
     }
 
@@ -385,6 +412,7 @@ final class USBMuxConnection: @unchecked Sendable {
             do {
                 try client.write(bytes)
             } catch {
+                mux.note("USB mux \(local):\(remote) client write ended: \(error)")
                 return
             }
         }

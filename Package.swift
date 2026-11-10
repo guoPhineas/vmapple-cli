@@ -16,7 +16,7 @@ let package = Package(
         .systemLibrary(name: "CTatsu", pkgConfig: "libtatsu-1.0"),
         .target(
             name: "CTicket",
-            dependencies: [.target(name: "CTatsu", condition: .when(platforms: [.linux]))]
+            dependencies: ["CTatsu"]
         ),
         .target(
             name: "VMAppleKit",
