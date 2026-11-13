@@ -1,5 +1,10 @@
 import Foundation
 
+public enum QEMUAccelerator: String, Sendable {
+    case kvm
+    case tcg
+}
+
 public struct QEMUOptions: Sendable {
     public var executable: String
     public var rom: String
@@ -7,6 +12,9 @@ public struct QEMUOptions: Sendable {
     public var memoryGiB: Int
     public var bootArguments: String
     public var handoffAddresses: [UInt64] = []
+    public var accelerator: QEMUAccelerator = .kvm
+    public var vulkanICD: String?
+    public var vncDisplay: String?
     /// iBoot reboots on its own, into recovery after a failed boot for one.
     /// A restore turns this off to see the restore OS finish.
     public var allowsReboot = true
@@ -41,7 +49,7 @@ public enum QEMUError: Error, CustomStringConvertible {
     }
 }
 
-/// One run of QEMU's `vmapple` machine under KVM.
+/// One run of QEMU's `vmapple` machine.
 public final class QEMUMachine: @unchecked Sendable {
     public let machine: VirtualMachine
     private let options: QEMUOptions
@@ -76,14 +84,16 @@ public final class QEMUMachine: @unchecked Sendable {
     var arguments: [String] {
         let id = String(machine.configuration.ecid, radix: 16, uppercase: true)
         let memory = "\(options.memoryGiB)G"
+        let cpu = options.accelerator == .kvm ? "host,pmu=off,kvm-psci-version=1.1" : "max,pauth-impdef=on"
+        let display = options.vncDisplay.map { "vnc=\($0)" } ?? "none"
         func path(_ url: URL) -> String { url.path }
         return [
-            "-machine", "vmapple,accel=kvm,uuid=0x\(id),gfx-device=reims-vgpu-mmio,memory-backend=guestmem",
+            "-machine", "vmapple,accel=\(options.accelerator.rawValue),uuid=0x\(id),gfx-device=reims-vgpu-mmio,memory-backend=guestmem",
             "-object", "memory-backend-file,id=guestmem,size=\(memory),share=on,align=16384,mem-path=\(path(machine.guestMemory))",
-            "-cpu", "host,pmu=off,kvm-psci-version=1.1",
+            "-cpu", cpu,
             "-smp", String(options.cpus),
             "-m", memory,
-            "-display", "none",
+            "-display", display,
             "-monitor", "none",
             // The console is logged to a file and also answers on a socket,
             // which `AccountProvisioner` types into.
@@ -110,6 +120,12 @@ public final class QEMUMachine: @unchecked Sendable {
     }
 
     public func start() throws {
+        if options.accelerator == .tcg && options.vulkanICD == nil {
+            throw QEMUError.refused("TCG requires --vulkan-icd; use a software Vulkan driver on a GPU-less host")
+        }
+        if let icd = options.vulkanICD, !FileManager.default.fileExists(atPath: icd) {
+            throw QEMUError.refused("Vulkan ICD does not exist: \(icd)")
+        }
         // The disks are opened without locks, so a second QEMU on them would
         // write the same blocks. One left behind by a killed `boot` still
         // listens on its monitor socket.
@@ -120,7 +136,7 @@ public final class QEMUMachine: @unchecked Sendable {
         for url in [machine.serialLog, machine.serialSocket, machine.qemuLog, machine.qmpSocket, machine.usbSocket, machine.guestMemory] {
             try? FileManager.default.removeItem(at: url)
         }
-        let cores = Self.preferredCores()
+        let cores = options.accelerator == .kvm ? Self.preferredCores() : []
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         // VMAPPLE_QEMU_ARGS adds arguments for debugging, such as -gdb.
         let extra = ProcessInfo.processInfo.environment["VMAPPLE_QEMU_ARGS"]?
@@ -150,7 +166,7 @@ public final class QEMUMachine: @unchecked Sendable {
         for name in ["REIMS_VGPU_WIRE_WATCH", "REIMS_VGPU_WIRE_GUARD"] where environment[name] == nil {
             environment[name] = "1"
         }
-        environment["VK_DRIVER_FILES"] = "/usr/share/vulkan/icd.d/nvidia_icd.json"
+        environment["VK_DRIVER_FILES"] = options.vulkanICD ?? "/usr/share/vulkan/icd.d/nvidia_icd.json"
         environment["TMPDIR"] = machine.directory.path
         environment["XDG_CACHE_HOME"] = machine.directory.appending(path: ".cache").path
         process.environment = environment

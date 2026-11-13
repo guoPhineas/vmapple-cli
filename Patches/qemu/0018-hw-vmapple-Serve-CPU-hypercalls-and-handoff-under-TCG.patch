@@ -1,0 +1,410 @@
+diff --git a/hw/vmapple/hvc.c b/hw/vmapple/hvc.c
+new file mode 100644
+index 0000000..1e1847e
+--- /dev/null
++++ b/hw/vmapple/hvc.c
+@@ -0,0 +1,159 @@
++/*
++ * VMApple CPU-service calls under TCG.
++ *
++ * PAC key inheritance and default PIDs follow the mechanism described in
++ * Orchard's hw/vmapple/hvc.c (Youssef Elliethy, 2026). The per-process key
++ * switching calls are acknowledged without changing the architected keys.
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include "qemu/error-report.h"
++#include "qemu/guest-random.h"
++#include "qemu/bswap.h"
++#include "qemu/units.h"
++#include "qemu/main-loop.h"
++#include "hw/core/cpu.h"
++#include "hw/vmapple/hvc.h"
++#include "exec/memattrs.h"
++#include "system/address-spaces.h"
++#include "system/memory.h"
++#include "target/arm/cpu.h"
++#include "target/arm/smccc.h"
++
++#define VMAPPLE_CPU_SERVICE_BASE UINT64_C(0xc1000000)
++
++static struct {
++    bool valid;
++    ARMPACKey apia, apib, apda, apdb, apga;
++} boot_keys;
++
++static uint64_t default_pids[2];
++static uint64_t handoff_pcs[4];
++static unsigned handoff_pc_count;
++static bool handoff_done;
++
++static void vmapple_handoff_load_pcs(void)
++{
++    const char *list = g_getenv("QEMU_VMAPPLE_HANDOFF_PC");
++    char **items = list ? g_strsplit(list, ",", -1) : NULL;
++
++    handoff_pc_count = 0;
++    for (unsigned i = 0; items && items[i] && i < 4; i++) {
++        uint64_t pc = g_ascii_strtoull(items[i], NULL, 0);
++        if (pc) {
++            handoff_pcs[handoff_pc_count++] = pc;
++        }
++    }
++    g_strfreev(items);
++    if (!handoff_pc_count) {
++        handoff_pcs[handoff_pc_count++] = UINT64_C(0xaca00000);
++    }
++}
++
++static bool vmapple_handoff_matches(uint64_t pc)
++{
++    for (unsigned i = 0; i < handoff_pc_count; i++) {
++        if (pc == handoff_pcs[i]) {
++            return true;
++        }
++    }
++    return false;
++}
++
++static void vmapple_handoff(ARMCPU *cpu)
++{
++    BQL_LOCK_GUARD();
++    CPUARMState *env = &cpu->env;
++    const char *args = g_getenv("QEMU_VMAPPLE_BOOT_ARGS");
++    uint64_t boot = env->xregs[1];
++    uint8_t info[112];
++    char payload[608] = { 0 };
++
++    if (handoff_done || CPU(cpu) != first_cpu || !boot ||
++        address_space_read(&address_space_memory, boot,
++                           MEMTXATTRS_UNSPECIFIED, info, sizeof(info)) != MEMTX_OK) {
++        return;
++    }
++    if (lduw_le_p(info) < 2 || lduw_le_p(info) > 3 ||
++        lduw_le_p(info + 2) != 2 ||
++        ldq_le_p(info + 96) < ldq_le_p(info + 8) ||
++        ldl_le_p(info + 104) == 0 || ldl_le_p(info + 104) > 4 * MiB) {
++        return;
++    }
++    g_strlcpy(payload, args ? args : "-v serial=11 debug=0x14c",
++              sizeof(payload));
++    if (address_space_write(&address_space_memory, boot + 108,
++                            MEMTXATTRS_UNSPECIFIED, payload,
++                            sizeof(payload)) != MEMTX_OK) {
++        error_report("vmapple TCG handoff: cannot write boot arguments");
++        return;
++    }
++    handoff_done = true;
++    info_report("vmapple TCG handoff: boot arguments set at 0x%" PRIx64,
++                boot + 108);
++}
++
++static bool vmapple_hvc(ARMCPU *cpu)
++{
++    BQL_LOCK_GUARD();
++    CPUARMState *env = &cpu->env;
++    uint64_t fid = env->xregs[0];
++
++    if (fid < VMAPPLE_CPU_SERVICE_BASE ||
++        fid >= VMAPPLE_CPU_SERVICE_BASE + 16) {
++        return false;
++    }
++
++    switch (fid - VMAPPLE_CPU_SERVICE_BASE) {
++    case 0: /* VMAPPLE_PAC_SET_INITIAL_STATE */
++        if (CPU(cpu) == first_cpu) {
++            boot_keys.apia = env->keys.apia;
++            boot_keys.apib = env->keys.apib;
++            boot_keys.apda = env->keys.apda;
++            boot_keys.apdb = env->keys.apdb;
++            boot_keys.apga = env->keys.apga;
++            boot_keys.valid = true;
++        } else if (boot_keys.valid) {
++            env->keys.apia = boot_keys.apia;
++            env->keys.apib = boot_keys.apib;
++            env->keys.apda = boot_keys.apda;
++            env->keys.apdb = boot_keys.apdb;
++            env->keys.apga = boot_keys.apga;
++        } else {
++            error_report("VMApple CPU_INITIALIZE cpu=%d before boot PAC context",
++                         CPU(cpu)->cpu_index);
++            env->xregs[0] = UINT64_MAX;
++            return true;
++        }
++        break;
++    case 1: /* VMAPPLE_PAC_GET_DEFAULT_KEYS */
++        env->xregs[2] = default_pids[0];
++        env->xregs[3] = default_pids[1];
++        break;
++    default:
++        /* Architected EL0 and EL1 PAC keys remain shared across tasks. */
++        break;
++    }
++
++    env->xregs[0] = 0;
++    return true;
++}
++
++void vmapple_hvc_reset(void)
++{
++    boot_keys.valid = false;
++    handoff_done = false;
++    do {
++        qemu_guest_getrandom_nofail(default_pids, sizeof(default_pids));
++    } while (!default_pids[0] || !default_pids[1]);
++}
++
++void vmapple_hvc_init(void)
++{
++    arm_smccc_set_handler(vmapple_hvc);
++    if (g_getenv("QEMU_VMAPPLE_HANDOFF")) {
++        vmapple_handoff_load_pcs();
++        arm_smccc_set_handoff(vmapple_handoff_matches, vmapple_handoff);
++    }
++    vmapple_hvc_reset();
++}
+diff --git a/hw/vmapple/hvc.h b/hw/vmapple/hvc.h
+new file mode 100644
+index 0000000..6c50a51
+--- /dev/null
++++ b/hw/vmapple/hvc.h
+@@ -0,0 +1,11 @@
++/*
++ * VMApple CPU-service calls under TCG.
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef HW_VMAPPLE_HVC_H
++#define HW_VMAPPLE_HVC_H
++
++void vmapple_hvc_init(void);
++void vmapple_hvc_reset(void);
++
++#endif
+diff --git a/hw/vmapple/meson.build b/hw/vmapple/meson.build
+index 9121a8b..97838ba 100644
+--- a/hw/vmapple/meson.build
++++ b/hw/vmapple/meson.build
+@@ -5,4 +5,4 @@ system_ss.add(when: 'CONFIG_VMAPPLE_BDIF', if_true: files('bdif.c'))
+ system_ss.add(when: 'CONFIG_VMAPPLE_BDIF', if_true: files('vusb.c', 'vusb-pci.c'))
+ system_ss.add(when: 'CONFIG_VMAPPLE_CFG',  if_true: files('cfg.c'))
+ system_ss.add(when: 'CONFIG_VMAPPLE_VIRTIO_BLK',  if_true: files('virtio-blk.c'))
+-specific_ss.add(when: 'CONFIG_VMAPPLE',     if_true: files('vmapple.c'))
++specific_ss.add(when: 'CONFIG_VMAPPLE',     if_true: files('vmapple.c', 'hvc.c'))
+diff --git a/hw/vmapple/vmapple.c b/hw/vmapple/vmapple.c
+index fb3f2af..3801d64 100644
+--- a/hw/vmapple/vmapple.c
++++ b/hw/vmapple/vmapple.c
+@@ -42,6 +42,7 @@
+ #include "hw/usb/hcd-xhci-pci.h"
+ #include "hw/virtio/virtio-pci.h"
+ #include "hw/vmapple/vmapple.h"
++#include "hw/vmapple/hvc.h"
+ #include "net/net.h"
+ #include "qapi/error.h"
+ #include "qapi/visitor.h"
+@@ -51,6 +52,7 @@
+ #include "system/hvf.h"
+ #include "system/hw_accel.h"
+ #include "system/kvm.h"
++#include "system/tcg.h"
+ #include "system/reset.h"
+ #include "system/runstate.h"
+ #include "system/system.h"
+@@ -561,6 +563,9 @@ static void vmapple_reset(void *opaque)
+     hwaddr base = vms->memmap[VMAPPLE_FIRMWARE].base;
+ 
+     cpu_set_pc(first_cpu, base);
++    if (tcg_enabled()) {
++        vmapple_hvc_reset();
++    }
+ }
+ 
+ static void mach_vmapple_init(MachineState *machine)
+@@ -575,6 +580,9 @@ static void mach_vmapple_init(MachineState *machine)
+ 
+     vms->memmap = memmap;
+     machine->usb = true;
++    if (tcg_enabled()) {
++        vmapple_hvc_init();
++    }
+ 
+     possible_cpus = mc->possible_cpu_arch_ids(machine);
+     assert(possible_cpus->len == max_cpus);
+@@ -604,6 +612,9 @@ static void mach_vmapple_init(MachineState *machine)
+         }
+         object_property_set_int(cpu, "psci-conduit", QEMU_PSCI_CONDUIT_HVC,
+                                 &error_fatal);
++        if (tcg_enabled()) {
++            object_property_set_int(cpu, "cntfrq", 24000000, &error_fatal);
++        }
+ 
+         /*
+          * Ventura's ApplePSCI driver accepts PSCI through version 1.1 and
+diff --git a/target/arm/meson.build b/target/arm/meson.build
+index 4412fde..0dd19d7 100644
+--- a/target/arm/meson.build
++++ b/target/arm/meson.build
+@@ -7,6 +7,7 @@ arm_stubs_ss = ss.source_set()
+ arm_user_ss = ss.source_set()
+ 
+ arm_common_system_ss.add(files('gdbstub.c'))
++arm_common_system_ss.add(files('smccc.c'))
+ arm_user_ss.add(files('gdbstub.c'))
+ 
+ arm_ss.add(when: 'TARGET_AARCH64', if_true: files(
+diff --git a/target/arm/smccc.c b/target/arm/smccc.c
+new file mode 100644
+index 0000000..dc65c71
+--- /dev/null
++++ b/target/arm/smccc.c
+@@ -0,0 +1,41 @@
++/*
++ * Board-specific SMCCC calls handled before the TCG PSCI switch.
++ *
++ * Based on Orchard's SMCCC dispatch (Youssef Elliethy, 2026).
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include "target/arm/smccc.h"
++
++static ARMSMCCCHandler smccc_handler;
++static bool (*handoff_matches)(uint64_t pc);
++static void (*handoff_apply)(ARMCPU *cpu);
++
++void arm_smccc_set_handler(ARMSMCCCHandler handler)
++{
++    smccc_handler = handler;
++}
++
++bool arm_smccc_dispatch(ARMCPU *cpu)
++{
++    return smccc_handler && smccc_handler(cpu);
++}
++
++void arm_smccc_set_handoff(bool (*matches)(uint64_t pc),
++                           void (*apply)(ARMCPU *cpu))
++{
++    handoff_matches = matches;
++    handoff_apply = apply;
++}
++
++bool arm_smccc_handoff_pc(uint64_t pc)
++{
++    return handoff_matches && handoff_matches(pc);
++}
++
++void arm_smccc_handoff(ARMCPU *cpu)
++{
++    if (handoff_apply) {
++        handoff_apply(cpu);
++    }
++}
+diff --git a/target/arm/smccc.h b/target/arm/smccc.h
+new file mode 100644
+index 0000000..a28b63d
+--- /dev/null
++++ b/target/arm/smccc.h
+@@ -0,0 +1,21 @@
++/*
++ * Board-specific SMCCC calls handled before the TCG PSCI switch.
++ *
++ * Based on Orchard's SMCCC dispatch (Youssef Elliethy, 2026).
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef TARGET_ARM_SMCCC_H
++#define TARGET_ARM_SMCCC_H
++
++#include "target/arm/cpu.h"
++
++typedef bool (*ARMSMCCCHandler)(ARMCPU *cpu);
++
++void arm_smccc_set_handler(ARMSMCCCHandler handler);
++bool arm_smccc_dispatch(ARMCPU *cpu);
++bool arm_smccc_handoff_pc(uint64_t pc);
++void arm_smccc_handoff(ARMCPU *cpu);
++void arm_smccc_set_handoff(bool (*matches)(uint64_t pc),
++                           void (*apply)(ARMCPU *cpu));
++
++#endif
+diff --git a/target/arm/tcg/helper-defs.h b/target/arm/tcg/helper-defs.h
+index 8ec6c16..9576d3f 100644
+--- a/target/arm/tcg/helper-defs.h
++++ b/target/arm/tcg/helper-defs.h
+@@ -58,6 +58,7 @@ DEF_HELPER_1(wfe, void, env)
+ DEF_HELPER_2(wfit, void, env, i32)
+ DEF_HELPER_1(yield, void, env)
+ DEF_HELPER_1(pre_hvc, void, env)
++DEF_HELPER_1(vmapple_handoff, void, env)
+ DEF_HELPER_2(pre_smc, void, env, i32)
+ DEF_HELPER_1(vesb, void, env)
+ DEF_HELPER_1(sev, void, env)
+diff --git a/target/arm/tcg/op_helper.c b/target/arm/tcg/op_helper.c
+index 9f9ea39..2f952d6 100644
+--- a/target/arm/tcg/op_helper.c
++++ b/target/arm/tcg/op_helper.c
+@@ -26,6 +26,16 @@
+ #include "accel/tcg/cpu-loop.h"
+ #include "accel/tcg/probe.h"
+ #include "cpregs.h"
++#ifndef CONFIG_USER_ONLY
++#include "target/arm/smccc.h"
++#endif
++
++void HELPER(vmapple_handoff)(CPUARMState *env)
++{
++#ifndef CONFIG_USER_ONLY
++    arm_smccc_handoff(env_archcpu(env));
++#endif
++}
+ 
+ #define SIGNBIT (uint32_t)0x80000000
+ #define SIGNBIT64 ((uint64_t)1 << 63)
+diff --git a/target/arm/tcg/psci.c b/target/arm/tcg/psci.c
+index 56754bd..e1d12f0 100644
+--- a/target/arm/tcg/psci.c
++++ b/target/arm/tcg/psci.c
+@@ -26,6 +26,7 @@
+ #include "arm-powerctl.h"
+ #include "target/arm/multiprocessing.h"
+ #include "target/arm/trace.h"
++#include "target/arm/smccc.h"
+ 
+ bool arm_is_psci_call(ARMCPU *cpu, int excp_type)
+ {
+@@ -72,6 +73,10 @@ void arm_handle_psci_call(ARMCPU *cpu)
+     int32_t ret = 0;
+     int i;
+ 
++    if (is_a64(env) && arm_smccc_dispatch(cpu)) {
++        return;
++    }
++
+     for (i = 0; i < 4; i++) {
+         /*
+          * All PSCI functions take explicit 32-bit or native int sized
+diff --git a/target/arm/tcg/translate-a64.c b/target/arm/tcg/translate-a64.c
+index 227719e..14f4b1f 100644
+--- a/target/arm/tcg/translate-a64.c
++++ b/target/arm/tcg/translate-a64.c
+@@ -29,6 +29,9 @@
+ #include "qemu/log.h"
+ #include "semihosting/semihost.h"
+ #include "cpregs.h"
++#ifndef CONFIG_USER_ONLY
++#include "target/arm/smccc.h"
++#endif
+ 
+ static TCGv_i64 cpu_X[32];
+ static TCGv_i64 cpu_gcspr[4];
+@@ -11043,6 +11046,11 @@ static void aarch64_tr_init_disas_context(DisasContextBase *dcbase,
+ 
+ static void aarch64_tr_tb_start(DisasContextBase *db, CPUState *cpu)
+ {
++#ifndef CONFIG_USER_ONLY
++    if (arm_smccc_handoff_pc(db->pc_first)) {
++        gen_helper_vmapple_handoff(tcg_env);
++    }
++#endif
+ }
+ 
+ static void aarch64_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)

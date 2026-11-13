@@ -6,7 +6,7 @@ import VMAppleKit
 struct VMAppleCLI: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "vmapple-cli",
-        abstract: "Virtual Macs on arm64 Linux with KVM.",
+        abstract: "Virtual Macs on Linux with QEMU.",
         subcommands: [Doctor.self, Probe.self, Create.self, Pull.self, Restore.self, Account.self, Boot.self, Screenshot.self, Click.self, Press.self, IBoot.self, Stop.self]
     )
 }
@@ -16,8 +16,14 @@ struct VMAppleCLI: ParsableCommand {
 struct Doctor: ParsableCommand {
     static let configuration = CommandConfiguration(abstract: "Check this host.")
 
+    @Flag(help: "Check the experimental TCG path instead of arm64 KVM.")
+    var tcg = false
+
+    @Option(help: "Vulkan ICD JSON for software rendering with --tcg.")
+    var vulkanICD: String?
+
     func run() throws {
-        let checks = HostChecks.all()
+        let checks = HostChecks.all(accelerator: tcg ? .tcg : .kvm, vulkanICD: vulkanICD)
         for check in checks {
             print("\(check.state.rawValue.padding(toLength: 8, withPad: " ", startingAt: 0))\(check.name.padding(toLength: 10, withPad: " ", startingAt: 0))\(check.detail)")
         }
@@ -78,14 +84,27 @@ struct MachineOptions: ParsableArguments {
     @Option(help: "OpenAVB's ROM, branch vmapple.")
     var rom = ProcessInfo.processInfo.environment["VMAPPLE_ROM"] ?? "OpenAVB.bin"
 
-    @Option(help: "Virtual CPUs, all on the host's fastest core kind.")
+    @Option(help: "Virtual CPUs; KVM pins them to the fastest ARM core kind.")
     var cpus = 4
 
     @Option(help: "Guest memory in GiB.")
     var memory = 8
 
+    @Flag(help: "Use experimental ARM64 TCG on Linux x86-64 instead of arm64 KVM.")
+    var tcg = false
+
+    @Option(help: "Vulkan ICD JSON; use a software driver such as lavapipe with --tcg.")
+    var vulkanICD: String?
+
+    @Option(help: "Expose the QEMU display through VNC, for example 127.0.0.1:0.")
+    var vnc: String?
+
     func options(bootArguments: String) -> QEMUOptions {
-        QEMUOptions(executable: qemu, rom: rom, cpus: cpus, memoryGiB: memory, bootArguments: bootArguments)
+        var options = QEMUOptions(executable: qemu, rom: rom, cpus: cpus, memoryGiB: memory, bootArguments: bootArguments)
+        options.accelerator = tcg ? .tcg : .kvm
+        options.vulkanICD = vulkanICD
+        options.vncDisplay = vnc
+        return options
     }
 }
 

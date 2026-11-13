@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Builds vmapple-cli for arm64 Linux with the Swift runtime, libtatsu and
+# Builds vmapple-cli for arm64 or x86-64 Linux with the Swift runtime, libtatsu and
 # libplist linked in, so the binary needs only glibc 2.35 or later and libcurl.
-# CI runs it in swift:6.4.2-jammy; any arm64 host with Docker can too:
+# CI runs it in swift:6.4.2-jammy; a matching host with Docker can too:
 #
 #   docker run --rm -v "$PWD":/src -w /src swift:6.4.2-jammy .github/build-linux.sh
 #
-# Writes dist/vmapple-cli-linux-arm64.tar.gz and its SHA-256.
+# Writes dist/vmapple-cli-linux-<arch>.tar.gz and its SHA-256.
 set -euo pipefail
 
 PLIST_VERSION=2.8.1
@@ -14,6 +14,11 @@ TATSU_VERSION=1.1.0
 TATSU_SHA256=96c8abd97552a4a0c487c701aba9a65d590c338dd331058ffb38304290b696c7
 
 root=$(pwd)
+case "$(uname -m)" in
+    aarch64) archive_arch=arm64 ;;
+    x86_64) archive_arch=x86_64 ;;
+    *) echo "unsupported host architecture: $(uname -m)" >&2; exit 1 ;;
+esac
 work=$(mktemp -d)
 deps=$work/prefix
 export PKG_CONFIG_PATH=$deps/lib/pkgconfig
@@ -56,7 +61,7 @@ swift build -c release --static-swift-stdlib "${link[@]}"
 
 binary=$(swift build -c release --static-swift-stdlib "${link[@]}" --show-bin-path)/vmapple-cli
 mkdir -p "$root/dist"
-staging=$work/vmapple-cli-linux-arm64
+staging=$work/vmapple-cli-linux-$archive_arch
 mkdir -p "$staging"
 strip -o "$staging/vmapple-cli" "$binary"
 cp "$root/README.md" "$root/LICENSE" "$staging/"
@@ -64,6 +69,6 @@ cp "$root/README.md" "$root/LICENSE" "$staging/"
 file "$staging/vmapple-cli"
 ldd "$staging/vmapple-cli"
 
-tar -czf "$root/dist/vmapple-cli-linux-arm64.tar.gz" -C "$work" vmapple-cli-linux-arm64
-(cd "$root/dist" && sha256sum vmapple-cli-linux-arm64.tar.gz > vmapple-cli-linux-arm64.tar.gz.sha256)
-cat "$root/dist/vmapple-cli-linux-arm64.tar.gz.sha256"
+tar -czf "$root/dist/vmapple-cli-linux-$archive_arch.tar.gz" -C "$work" "vmapple-cli-linux-$archive_arch"
+(cd "$root/dist" && sha256sum "vmapple-cli-linux-$archive_arch.tar.gz" > "vmapple-cli-linux-$archive_arch.tar.gz.sha256")
+cat "$root/dist/vmapple-cli-linux-$archive_arch.tar.gz.sha256"

@@ -23,6 +23,18 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  linux-x86_64:
+    runs-on: ubuntu-24.04
+    container: swift:6.4.2-jammy
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: .github/build-linux.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vmapple-cli-linux-x86_64
+          path: dist/
+          if-no-files-found: error
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: linux-arm64

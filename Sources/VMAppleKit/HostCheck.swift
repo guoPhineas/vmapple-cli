@@ -17,17 +17,24 @@ public enum HostChecks {
     /// Room for an IPSW, a guest disk, and the QEMU and Rust build trees.
     static let minimumFreeBytes: Int64 = 100 * 1024 * 1024 * 1024
 
-    public static func all() -> [HostCheck] {
-        [architecture(), kvm(), pointerAuthentication(), vulkan(), disk()]
+    public static func all(accelerator: QEMUAccelerator = .kvm, vulkanICD: String? = nil) -> [HostCheck] {
+        let host = architecture(accelerator: accelerator)
+        let graphics = vulkan(accelerator: accelerator, icd: vulkanICD)
+        let storage = disk()
+        if accelerator == .kvm {
+            return [host, kvm(), pointerAuthentication(), graphics, storage]
+        }
+        return [host, graphics, storage]
     }
 
-    static func architecture() -> HostCheck {
+    static func architecture(accelerator: QEMUAccelerator = .kvm) -> HostCheck {
         var system = utsname()
         uname(&system)
         let name = field(of: system.sysname)
         let machine = field(of: system.machine)
         let release = field(of: system.release)
-        let ok = name == "Linux" && machine == "aarch64"
+        let supported = accelerator == .kvm ? ["aarch64"] : ["aarch64", "x86_64"]
+        let ok = name == "Linux" && supported.contains(machine)
         return HostCheck(name: "host", state: ok ? .ok : .missing, detail: "\(name) \(machine) \(release)")
     }
 
@@ -53,8 +60,11 @@ public enum HostChecks {
         return HostCheck(name: "pac", state: ok ? .ok : .missing, detail: ok ? "paca pacg" : "no paca/pacg")
     }
 
-    static func vulkan() -> HostCheck {
-        let path = "/usr/share/vulkan/icd.d/nvidia_icd.json"
+    static func vulkan(accelerator: QEMUAccelerator = .kvm, icd: String? = nil) -> HostCheck {
+        guard accelerator == .kvm || icd != nil else {
+            return HostCheck(name: "vulkan", state: .missing, detail: "pass --vulkan-icd with a software Vulkan driver")
+        }
+        let path = icd ?? "/usr/share/vulkan/icd.d/nvidia_icd.json"
         let ok = FileManager.default.fileExists(atPath: path)
         return HostCheck(name: "vulkan", state: ok ? .ok : .missing, detail: ok ? path : "no \(path)")
     }

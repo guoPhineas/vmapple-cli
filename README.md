@@ -4,6 +4,8 @@
 
 `vmapple-cli` restores macOS from an IPSW and boots it on QEMU's `vmapple` machine under KVM, on arm64 Linux, with no Mac anywhere in the flow and no root.
 
+An experimental TCG path for x86-64 Linux without a GPU is under development; it has not booted a guest on that host yet.
+
 > [!WARNING]
 > Apple's licence permits macOS to run in a virtual machine only on Apple hardware. This repository contains no Apple software; whoever runs a guest supplies the IPSW and answers for that.
 
@@ -56,6 +58,17 @@ vmapple-cli stop vms/sonoma
 ```
 
 `create` makes a VM directory with blank disks. `restore` installs macOS from the IPSW (about 5–10 minutes on the tested host) and asks Apple's signing server for the tickets, so it needs the internet. `account` is optional: it creates an administrator and skips Setup Assistant; the password comes from `VMAPPLE_PASSWORD`. `boot` runs until the guest stops. Stop a guest with `stop` (or Shut Down inside macOS), not by killing QEMU: killing it counts as a failed boot, and after a few of those the guest boots into recovery.
+
+## Experimental x86-64 Linux path
+
+Build the CLI on x86-64 Linux and apply `Patches/qemu/0001` through `0018` to the pinned QEMU tree. Install a software Vulkan ICD such as Mesa lavapipe. The TCG path is untested on a Linux host, including restore and graphics; see [the research status](Documents/Research/x86-tcg-headless.md).
+
+```sh
+vmapple-cli doctor --tcg --vulkan-icd /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+vmapple-cli boot vms/sonoma --tcg --vulkan-icd /usr/share/vulkan/icd.d/lvp_icd.x86_64.json --vnc 127.0.0.1:0
+```
+
+The VNC listener binds to the host's loopback address. Forward port 5900 over SSH to view it from another computer. The same `--tcg` and `--vulkan-icd` options are available to `restore` and `account`.
 
 ## Further Reading and Licence
 

@@ -18,6 +18,11 @@ disk boots through OpenAVB, iBoot and XNU to `launchd` without a host.
 | 26.6.2 (25G83) | works, 6 min, twice | works with `account`: login, desktop; of two cold boots on 2026-11-09 at this level one was clean and one panicked while shutting down (`Debugger synch pending on cpu 2`); three cold boots to the login window on 2026-11-12, at reims 0068, 0070 and 0071, and one on 2026-11-13 at 0076, each with a clean shutdown from it | the menu bar, widgets and every Dock icon draw; the background is dark grey or near-white instead of the wallpaper, and Spotlight and the menu bar garble (reims 0040); at 0068, 0070, 0071 and 0076 the login window's background is grey instead of the wallpaper | qemu 0001–0017, reims 0001–0076, metal2vulkan 0001–0004 (login window only); the desktop at qemu 0001–0016, reims 0001–0040 |
 | 27.2 (26B123) | works, 6 min | works with `account` (Setup Assistant alone restarts the guest after Data & Privacy): login, the user's own setup panels, desktop; seven boots on 2026-11-09, five cold and two warm, no panic; about twenty to the desktop on 2026-11-11 and 2026-11-12, and about forty more on 2026-11-12 with 0069–0071 and diagnostic builds of them; four cold boots to the desktop at protocol 237 on 2026-11-13, at 0075 and 0076, and about thirty with diagnostic builds | at 0076 the guest runs at protocol 237: the wallpaper, menu bar, Dock and menus with their items draw, and About This Mac drew its text on first open in each of the three boots that opened it. Liquid Glass draws a blurred backdrop when CoreAnimation captures a display buffer WindowServer still presents; when it captures the boot screen's retired buffer, the glass stays grey and once showed the boot Apple logo. See [rendering-2026-11-11.md](Research/rendering-2026-11-11.md#protocol-237) | qemu 0001–0017, reims 0001–0076, metal2vulkan 0001–0004 |
 
+The x86-64 Linux TCG and software Vulkan path has not been run on a real host. Patch
+0018 adds the TCG CPU-service and kernel handoff path; the macOS version rows
+above remain ARM64 KVM measurements. See
+[x86-tcg-headless.md](Research/x86-tcg-headless.md).
+
 Every row was rerun on 2026-11-09 with Reims's wire watch and guard on, cold
 (Reims translates the shaders and builds the pipelines the boot meets) and warm
 (a later boot that finds them in the caches in the VM's directory). Each boot
@@ -206,7 +211,9 @@ on the host, built as a user:
 | libtatsu, libplist, libimobiledevice | libimobiledevice's | none |
 | `lzfse`, `unzip` | the distribution | none |
 
-`doctor` needs arm64 Linux to pass. `probe` needs `/dev/kvm`.
+Default `doctor` needs arm64 Linux to pass. `doctor --tcg --vulkan-icd PATH`
+checks Linux x86-64 or arm64, the ICD file and free disk space; it does not
+exercise Vulkan. `probe` needs `/dev/kvm` and remains an arm64 KVM test.
 
 The release binary comes from [build-linux.sh](../.github/build-linux.sh), which
 links libtatsu, libplist and the Swift runtime in. Which hosts should work:
